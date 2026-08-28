@@ -65,7 +65,7 @@ class TwinLiteNetDataset(Dataset):
                 # Environmental/sensor noise simulation
                 A.OneOf([
                     A.RandomRain(rain_type="heavy", brightness_coefficient=0.8, p=0.3),
-                    A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_lower=0, angle_upper=180, num_flare_circles=3, p=0.3),
+                    A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), p=0.3),
                     A.GaussianBlur(blur_limit=(3, 7), p=0.3)
                 ], p=0.5),
                 A.RandomBrightnessContrast(p=0.5),
