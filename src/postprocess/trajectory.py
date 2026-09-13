@@ -37,34 +37,33 @@ class TrajectoryEngine:
 
     def extract_corridor_boundaries(self, drivable_mask):
         """
-        Fallback logic: When lane markings disappear on dirt or unpaved roads,
-        extracts the outer boundary contours of the drivable area mask to synthesize virtual guidelines.
+        Fallback logic: Uses morphological closing to bridge shadow gaps, 
+        then uses row-by-row scanlines to extract outer boundaries, 
+        preventing crossed trajectory curves on unpaved or unmarked roads.
         """
-        # Find contours of the drivable space mask
-        contours, _ = cv2.findContours(drivable_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
+        # 1. Morphological Closing to bridge shadow gaps
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        closed_mask = cv2.morphologyEx(drivable_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+
+        left_pts = []
+        right_pts = []
+        start_y = int(self.height * 0.55)
+
+        # 2. Row-by-Row Scanline boundary extraction
+        # Scan from the bottom of the image (car bonnet) upwards to the horizon
+        for y in range(self.height - 1, start_y, -4):
+            x_indices = np.where(closed_mask[y, :] > 0)[0]
+            
+            if len(x_indices) > 10:  # Require a minimum contiguous width to count as road
+                left_pts.append([x_indices[0], y])      # Absolute left-most pixel
+                right_pts.append([x_indices[-1], y])    # Absolute right-most pixel
+
+        if len(left_pts) < 10 or len(right_pts) < 10:
             return None, None, None, None
 
-        # Extract largest contour (main road body)
-        largest_contour = max(contours, key=cv2.contourArea)
-        contour_points = largest_contour.squeeze()
-
-        if len(contour_points.shape) < 2:
-            return None, None, None, None
-
-        # Filter points in lower half of image (bottom perspective near vehicle)
-        bottom_pts = contour_points[contour_points[:, 1] >= int(self.height * 0.55)]
-        
-        if len(bottom_pts) < 20:
-            return None, None, None, None
-
-        # Separate left and right edges based on horizontal midpoint
-        left_pts = bottom_pts[bottom_pts[:, 0] < self.camera_center_x]
-        right_pts = bottom_pts[bottom_pts[:, 0] >= self.camera_center_x]
-
-        left_coeffs, left_x, left_y = self.fit_polynomial_from_pts(left_pts)
-        right_coeffs, right_x, right_y = self.fit_polynomial_from_pts(right_pts)
+        # Fit polynomials to the extracted arrays
+        left_coeffs, left_x, left_y = self.fit_polynomial_from_pts(np.array(left_pts))
+        right_coeffs, right_x, right_y = self.fit_polynomial_from_pts(np.array(right_pts))
 
         return left_x, left_y, right_x, right_y
 
