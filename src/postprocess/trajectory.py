@@ -3,143 +3,180 @@ import cv2
 
 class TrajectoryEngine:
     """
-    Transforms raw neural network probability masks into geometric vectors,
-    quadratic polynomial curves, dynamic vehicle offset metrics, and dynamic fallbacks.
+    Processes raw binary segmentation masks into physical telemetry,
+    trajectory polynomials, and mode-switching logic.
     """
-    def __init__(self, image_shape=(640, 360), meter_per_pixel_x=3.7 / 400.0):
-        """
-        Args:
-            image_shape (tuple): Frame resolution (Width, Height) = (640, 360)
-            meter_per_pixel_x (float): Horizontal calibration ratio (approx 3.7 meters standard lane width / ~400 pixels)
-        """
-        self.width, self.height = image_shape
-        self.camera_center_x = self.width / 2.0
-        self.meter_per_pixel_x = meter_per_pixel_x
+    def __init__(self, image_shape=(640, 360)):
+        self.W, self.H = image_shape[0], image_shape[1]
+        self.cam_center_x = self.W // 2
         
-    def fit_polynomial(self, binary_mask):
-        """
-        Fits a 2nd-order quadratic polynomial x = a*y^2 + b*y + c to pixel coordinates.
-        Returns polynomial coefficients [a, b, c] and plotted x-coordinates.
-        """
-        y_indices, x_indices = np.where(binary_mask > 0)
-        
-        if len(y_indices) < 50:  # Not enough active pixels for reliable curve fitting
-            return None, None, None
-
-        # Fit quadratic curve (x as function of y to handle vertical/near-vertical lines cleanly)
-        poly_coeffs = np.polyfit(y_indices, x_indices, 2)
-        
-        # Generate target Y evaluation points from horizon to bonnet
-        plot_y = np.linspace(int(self.height * 0.55), self.height - 1, num=30)
-        plot_x = poly_coeffs[0] * (plot_y ** 2) + poly_coeffs[1] * plot_y + poly_coeffs[2]
-        
-        return poly_coeffs, plot_x, plot_y
-
-    def extract_corridor_boundaries(self, drivable_mask):
-        """
-        Fallback logic: Uses morphological closing to bridge shadow gaps, 
-        then uses row-by-row scanlines to extract outer boundaries, 
-        preventing crossed trajectory curves on unpaved or unmarked roads.
-        """
-        # 1. Morphological Closing to bridge shadow gaps
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        closed_mask = cv2.morphologyEx(drivable_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-
-        left_pts = []
-        right_pts = []
-        start_y = int(self.height * 0.55)
-
-        # 2. Row-by-Row Scanline boundary extraction
-        # Scan from the bottom of the image (car bonnet) upwards to the horizon
-        for y in range(self.height - 1, start_y, -4):
-            x_indices = np.where(closed_mask[y, :] > 0)[0]
-            
-            if len(x_indices) > 10:  # Require a minimum contiguous width to count as road
-                left_pts.append([x_indices[0], y])      # Absolute left-most pixel
-                right_pts.append([x_indices[-1], y])    # Absolute right-most pixel
-
-        if len(left_pts) < 10 or len(right_pts) < 10:
-            return None, None, None, None
-
-        # Fit polynomials to the extracted arrays
-        left_coeffs, left_x, left_y = self.fit_polynomial_from_pts(np.array(left_pts))
-        right_coeffs, right_x, right_y = self.fit_polynomial_from_pts(np.array(right_pts))
-
-        return left_x, left_y, right_x, right_y
-
-    def fit_polynomial_from_pts(self, pts):
-        """Fits poly curve x = a*y^2 + b*y + c directly from array of [x, y] points."""
-        if len(pts) < 10:
-            return None, None, None
-        x_coords = pts[:, 0]
-        y_coords = pts[:, 1]
-        
-        coeffs = np.polyfit(y_coords, x_coords, 2)
-        plot_y = np.linspace(int(self.height * 0.55), self.height - 1, num=30)
-        plot_x = coeffs[0] * (plot_y ** 2) + coeffs[1] * plot_y + coeffs[2]
-        return coeffs, plot_x, plot_y
+        # Rough physical calibration: Assuming a standard lane is ~3.7 meters wide
+        # and occupies ~250 pixels at the bottom edge of a 640x360 frame.
+        # 370 cm / 250 px = ~1.5 cm/px
+        self.cm_per_pixel = 1.5 
 
     def process_frame(self, drivable_mask, lane_mask):
-        """
-        Processes multi-head neural outputs and generates navigation telemetry.
-        Returns dictionary containing trajectory points, offset metrics, and operation mode.
-        """
-        lane_pixel_count = np.sum(lane_mask > 0)
-        mode = "LANE_GUIDANCE"
+        """Extracts lane boundaries and computes telemetry offsets."""
         
-        left_x, left_y, right_x, right_y = None, None, None, None
-        
-        # Primary Mode: Dedicated Lane Lines detected
-        if lane_pixel_count > 150:
-            # Separate left and right lane markings using camera center
-            y_pts, x_pts = np.where(lane_mask > 0)
-            left_mask = np.zeros_like(lane_mask)
-            right_mask = np.zeros_like(lane_mask)
-            
-            left_indices = x_pts < self.camera_center_x
-            right_indices = x_pts >= self.camera_center_x
-            
-            left_mask[y_pts[left_indices], x_pts[left_indices]] = 1
-            right_mask[y_pts[right_indices], x_pts[right_indices]] = 1
-            
-            _, left_x, left_y = self.fit_polynomial(left_mask)
-            _, right_x, right_y = self.fit_polynomial(right_mask)
-
-        # Fallback Mode: Sparse lane activation (Unstructured / Dirt / Unmarked road)
-        if left_x is None or right_x is None:
-            mode = "UNMARKED_CORRIDOR_FALLBACK"
-            left_x, left_y, right_x, right_y = self.extract_corridor_boundaries(drivable_mask)
-
-        # Calculate vehicle offset at bonnet height (y = self.height - 1)
-        target_y = self.height - 1
-        
-        if left_x is not None and right_x is not None:
-            lane_center_x = (left_x[-1] + right_x[-1]) / 2.0
-        elif left_x is not None:
-            lane_center_x = left_x[-1] + 200.0  # Default nominal lane half-width
-        elif right_x is not None:
-            lane_center_x = right_x[-1] - 200.0
-        else:
-            # Fallback to drivable space horizontal centroid
-            drivable_bottom = drivable_mask[int(self.height * 0.8):, :]
-            y_indices, x_indices = np.where(drivable_bottom > 0)
-            if len(x_indices) > 0:
-                lane_center_x = np.mean(x_indices)
-            else:
-                lane_center_x = self.camera_center_x
-
-        # Calculate lateral displacement (in cm)
-        pixel_offset = self.camera_center_x - lane_center_x
-        offset_meters = pixel_offset * self.meter_per_pixel_x
-        offset_cm = offset_meters * 100.0
-
-        return {
-            "mode": mode,
-            "left_x": left_x,
-            "left_y": left_y,
-            "right_x": right_x,
-            "right_y": right_y,
-            "lane_center_x": lane_center_x,
-            "offset_cm": offset_cm,
-            "direction": "RIGHT" if offset_cm < 0 else ("LEFT" if offset_cm > 0 else "CENTER")
+        # Default fallback payload
+        traj_data = {
+            "mode": "UNMARKED_CORRIDOR_FALLBACK",
+            "left_x": None, "left_y": None,
+            "right_x": None, "right_y": None,
+            "lane_center_x": self.cam_center_x,
+            "offset_cm": 0.0,
+            "direction": "CENTER"
         }
+        
+        # 1. ROI Mask: Ignore upper 45% of the image (sky, trees, powerlines)
+        roi_mask = np.zeros_like(lane_mask)
+        roi_mask[int(self.H * 0.45):, :] = 1
+        clean_lanes = cv2.bitwise_and(lane_mask, lane_mask, mask=roi_mask)
+
+        # A tall, narrow kernel (3x35) connects vertical dashes without bridging horizontal noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 35))
+        clean_lanes = cv2.morphologyEx(clean_lanes, cv2.MORPH_CLOSE, kernel)
+        
+        # 2. Area Thresholding (Must be at least 0.4% of the image to be a real lane)
+        min_pixels = int(self.H * self.W * 0.004)
+        if np.count_nonzero(clean_lanes) < min_pixels:
+            return self._fallback_to_drivable(drivable_mask, traj_data)
+            
+        # 3. Contour Extraction & Filtering
+        contours, _ = cv2.findContours(clean_lanes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_lines = []
+        for cnt in contours:
+            # Reject tiny noise artifacts
+            if cv2.contourArea(cnt) < 100:
+                continue
+                
+            x, y, w, h = cv2.boundingRect(cnt)
+            # Reject horizontal lines (bumpers, crosswalks) by requiring vertical height
+            if h < 30: 
+                continue
+                
+            valid_lines.append(cnt.reshape(-1, 2))
+            
+        if not valid_lines:
+            return self._fallback_to_drivable(drivable_mask, traj_data)
+            
+        # 4. Split Lane Candidates into Left and Right relative to camera center
+        left_pts, right_pts = [], []
+        for line in valid_lines:
+            if np.mean(line[:, 0]) < self.cam_center_x:
+                left_pts.append(line)
+            else:
+                right_pts.append(line)
+                
+        # 5. Polynomial Curve Fitting (x as a function of y)
+        # Create y-coordinates starting from the mid-horizon to the bottom of the frame
+        plot_y = np.linspace(int(self.H * 0.55), self.H - 1, num=20).astype(np.int32)
+        
+        left_fit_x = self._fit_curve(left_pts, plot_y)
+        right_fit_x = self._fit_curve(right_pts, plot_y)
+        
+        # 6. Arbitration & Telemetry Calculation
+        if left_fit_x is not None or right_fit_x is not None:
+            traj_data["mode"] = "LANE_GUIDANCE"
+            
+            if left_fit_x is not None:
+                traj_data["left_x"], traj_data["left_y"] = left_fit_x, plot_y
+            if right_fit_x is not None:
+                traj_data["right_x"], traj_data["right_y"] = right_fit_x, plot_y
+                
+            # Calculate the target lane center specifically at the bottom edge (closest to car)
+            bottom_idx = -1 
+            if left_fit_x is not None and right_fit_x is not None:
+                center_x = (left_fit_x[bottom_idx] + right_fit_x[bottom_idx]) / 2.0
+            elif left_fit_x is not None:
+                # If only left lane is visible, project center ~125px to the right
+                center_x = left_fit_x[bottom_idx] + 125 
+            else:
+                # If only right lane is visible, project center ~125px to the left
+                center_x = right_fit_x[bottom_idx] - 125
+                
+            # Compute lateral offset metrics
+            # 1. Clamp the raw center_x to prevent wild off-screen extrapolations
+            center_x = np.clip(center_x, -100, self.W + 100)
+            traj_data["lane_center_x"] = np.clip(center_x, 0, self.W)
+            
+            offset_px = center_x - self.cam_center_x
+            
+            # 2. Calculate cm and strictly cap the maximum logical offset (~4.5 meters)
+            raw_offset_cm = abs(offset_px * self.cm_per_pixel)
+            traj_data["offset_cm"] = float(np.clip(raw_offset_cm, 0.0, 450.0))
+            
+            # Deadzone of 10 pixels before declaring a side
+            if offset_px > 10:
+                traj_data["direction"] = "RIGHT"
+            elif offset_px < -10:
+                traj_data["direction"] = "LEFT"
+            else:
+                traj_data["direction"] = "CENTER"
+        else:
+            return self._fallback_to_drivable(drivable_mask, traj_data)
+            
+        return traj_data
+
+    def _fit_curve(self, pts_list, plot_y):
+        """Fits a degree-2 polynomial x = a*y^2 + b*y + c to avoid vertical slope singularities."""
+        if not pts_list:
+            return None
+            
+        all_pts = np.vstack(pts_list)
+        xs, ys = all_pts[:, 0], all_pts[:, 1]
+        
+        try:
+            coeffs = np.polyfit(ys, xs, 2)
+            fit_x = coeffs[0] * (plot_y ** 2) + coeffs[1] * plot_y + coeffs[2]
+            return fit_x.astype(np.int32)
+        except np.linalg.LinAlgError:
+            return None
+            
+    def _fallback_to_drivable(self, drivable_mask, traj_data):
+        """If lanes are missing, calculates center-of-mass and extracts outer corridor edges."""
+        # 1. Calculate Telemetry (Center of Mass)
+        M = cv2.moments(drivable_mask)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            traj_data["lane_center_x"] = cx
+            offset_px = cx - self.cam_center_x
+            
+            raw_offset_cm = abs(offset_px * self.cm_per_pixel)
+            traj_data["offset_cm"] = float(np.clip(raw_offset_cm, 0.0, 450.0))
+            
+            if offset_px > 10:
+                traj_data["direction"] = "RIGHT"
+            elif offset_px < -10:
+                traj_data["direction"] = "LEFT"
+            else:
+                traj_data["direction"] = "CENTER"
+                
+        # 2. Extract Outer Boundaries for HUD Visuals (Blue Curves)
+        left_pts = []
+        right_pts = []
+        start_y = int(self.H * 0.55)
+        
+        # Scan from the bottom of the screen upwards to find the edges of the green mask
+        for y in range(self.H - 1, start_y, -5):
+            row = drivable_mask[y, :]
+            x_indices = np.where(row > 0)[0]
+            
+            if len(x_indices) > 10: # Require a minimum width to count as a valid surface
+                left_pts.append([x_indices[0], y])      # Left-most green pixel
+                right_pts.append([x_indices[-1], y])    # Right-most green pixel
+                
+        # 3. Fit Polynomials to the extracted edges
+        plot_y = np.linspace(int(self.H * 0.55), self.H - 1, num=20).astype(np.int32)
+        
+        if len(left_pts) >= 5:
+            traj_data["left_x"] = self._fit_curve([np.array(left_pts)], plot_y)
+            if traj_data["left_x"] is not None:
+                traj_data["left_y"] = plot_y
+                
+        if len(right_pts) >= 5:
+            traj_data["right_x"] = self._fit_curve([np.array(right_pts)], plot_y)
+            if traj_data["right_x"] is not None:
+                traj_data["right_y"] = plot_y
+                
+        return traj_data
