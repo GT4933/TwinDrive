@@ -78,7 +78,7 @@ class HUDVisualizer:
 
 class ADASInferencePipeline:
     """Executes end-to-end model inference, trajectory post-processing, and HUD generation."""
-    def __init__(self, weights_path="weights/best_model.pth", device=None, lane_thresh=0.50):
+    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lane_thresh = lane_thresh
         print(f"\nInitializing ADAS Pipeline on Hardware: {self.device}")
@@ -158,7 +158,7 @@ def run_batch_inference(
 ):
     """Runs batch inference with sampling options and configurable lane sensitivity."""
     os.makedirs(output_dir, exist_ok=True)
-    pipeline = ADASInferencePipeline(weights_path="weights/best_model.pth", lane_thresh=lane_thresh)
+    pipeline = ADASInferencePipeline(weights_path="twin/weights/best_model.pth", lane_thresh=lane_thresh)
 
     if not os.path.exists(source_dir):
         print(f"Source path '{source_dir}' does not exist!")
@@ -217,7 +217,7 @@ def run_batch_inference(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TwinLiteNet Real-Time ADAS Telemetry Engine")
     parser.add_argument("--source", type=str, default="data/processed/val/images")
-    parser.add_argument("--output", type=str, default="outputs/predictions")
+    parser.add_argument("--output", type=str, default="twin/outputs/predictions")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--random", action="store_true", help="Sample images randomly rather than alphabetically")
     parser.add_argument("--bdd-only", action="store_true", help="Filter for BDD100K images (exclude IDD Lite)")
