@@ -192,28 +192,39 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Generate mock training and validation datasets programmatically
-    generate_mock_driving_data("data/processed/train", count=10)
-    generate_mock_driving_data("data/processed/val", count=4)
+    # generate_mock_driving_data("data/processed/train", count=10)
+    # generate_mock_driving_data("data/processed/val", count=4)
     
     # Initialize PyTorch dataset pipelines
     print("\nInitializing PyTorch datasets...")
     train_dataset = TwinLiteNetDataset(data_dir="data/processed/train", image_size=(640, 360), is_train=True)
     val_dataset = TwinLiteNetDataset(data_dir="data/processed/val", image_size=(640, 360), is_train=False)
     
+    print(f"Verified Real Training Samples   : {len(train_dataset)}")
+    print(f"Verified Real Validation Samples : {len(val_dataset)}")
+    
     # Initialize DataLoader
     train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
     
-    # Extract a single sample batch to verify shapes and tensor configurations
-    print("\nFetching sample batch from DataLoader...")
-    images, drivable_masks, lane_masks = next(iter(train_loader))
+    # Extract batches until active lane markings are found
+    print("\nScanning batches to verify active lane annotations...")
+    found_lanes = False
     
-    print("\n" + "-" * 40)
-    print("Batch Processing Verification: SUCCESS!")
-    print("-" * 40)
-    print(f"Image Batch Tensor Shape (Batch, Channels, Height, Width): {images.shape}")
-    print(f"Drivable Area Mask Batch Shape (Batch, Height, Width)      : {drivable_masks.shape}")
-    print(f"Lane Lines Mask Batch Shape (Batch, Height, Width)          : {lane_masks.shape}")
-    print(f"Images Value Range (Min / Max)                             : {images.min():.4f} / {images.max():.4f}")
-    print(f"Drivable Mask Classes Present                              : {torch.unique(drivable_masks).tolist()}")
-    print(f"Lane Mask Classes Present                                  : {torch.unique(lane_masks).tolist()}")
+    for images, drivable_masks, lane_masks in train_loader:
+        if 1 in torch.unique(lane_masks).tolist():
+            found_lanes = True
+            print("\n" + "-" * 40)
+            print("Batch Processing Verification: SUCCESS!")
+            print("-" * 40)
+            print(f"Image Batch Tensor Shape (Batch, Channels, Height, Width): {images.shape}")
+            print(f"Drivable Area Mask Batch Shape (Batch, Height, Width)      : {drivable_masks.shape}")
+            print(f"Lane Lines Mask Batch Shape (Batch, Height, Width)         : {lane_masks.shape}")
+            print(f"Images Value Range (Min / Max)                             : {images.min():.4f} / {images.max():.4f}")
+            print(f"Drivable Mask Classes Present                              : {torch.unique(drivable_masks).tolist()}")
+            print(f"Lane Mask Classes Present                                  : {torch.unique(lane_masks).tolist()}")
+            break
+            
+    if not found_lanes:
+        print("\n[Warning]: Sampled batches contained only unstriped roads.")
+        
     print("=" * 60)

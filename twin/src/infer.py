@@ -78,7 +78,7 @@ class HUDVisualizer:
 
 class ADASInferencePipeline:
     """Executes end-to-end model inference, trajectory post-processing, and HUD generation."""
-    def __init__(self, weights_path="weights/best_model.pth", device=None, lane_thresh=0.30):
+    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lane_thresh = lane_thresh
         print(f"\nInitializing ADAS Pipeline on Hardware: {self.device}")
@@ -132,7 +132,7 @@ class ADASInferencePipeline:
         lane_prob = self._extract_prob(lane_logits)
 
         # Thresholding (using adaptive lane threshold for early checkpoint convergence)
-        drivable_mask = (drivable_prob > 0.5).astype(np.uint8)
+        drivable_mask = (drivable_prob > 0.35).astype(np.uint8)
         lane_mask = (lane_prob > self.lane_thresh).astype(np.uint8)
 
         # Trajectory & Geometry Post-Processing
@@ -154,29 +154,37 @@ def run_batch_inference(
     max_samples=10,
     random_sample=False,
     bdd_only=False,
-    lane_thresh=0.30,
+    lane_thresh=0.50,
 ):
     """Runs batch inference with sampling options and configurable lane sensitivity."""
     os.makedirs(output_dir, exist_ok=True)
-    pipeline = ADASInferencePipeline(weights_path="weights/best_model.pth", lane_thresh=lane_thresh)
+    pipeline = ADASInferencePipeline(weights_path="twin/weights/best_model.pth", lane_thresh=lane_thresh)
 
     if not os.path.exists(source_dir):
-        print(f"Source directory '{source_dir}' does not exist!")
+        print(f"Source path '{source_dir}' does not exist!")
         return
 
-    all_files = [f for f in os.listdir(source_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-
-    if bdd_only:
-        all_files = [f for f in all_files if not f.startswith("idd_lite")]
-
-    if not all_files:
-        print(f"No valid image files matched in '{source_dir}'!")
-        return
-
-    if random_sample:
-        selected_files = random.sample(all_files, min(max_samples, len(all_files)))
+    # Check if the user passed a direct file path instead of a folder
+    if os.path.isfile(source_dir):
+        target_dir = os.path.dirname(source_dir)
+        fname = os.path.basename(source_dir)
+        selected_files = [fname]
+        source_dir = target_dir  # Reassign so the loop builds the path correctly
     else:
-        selected_files = sorted(all_files)[:max_samples]
+        # Standard directory batch processing
+        all_files = [f for f in os.listdir(source_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+
+        if bdd_only:
+            all_files = [f for f in all_files if not f.startswith("idd_lite")]
+
+        if not all_files:
+            print(f"No valid image files matched in '{source_dir}'!")
+            return
+
+        if random_sample:
+            selected_files = random.sample(all_files, min(max_samples, len(all_files)))
+        else:
+            selected_files = sorted(all_files)[:max_samples]
 
     print("=" * 65)
     print(f"        RUNNING ADAS TELEMETRY INFERENCE ON {len(selected_files)} FRAMES")
@@ -209,11 +217,11 @@ def run_batch_inference(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TwinLiteNet Real-Time ADAS Telemetry Engine")
     parser.add_argument("--source", type=str, default="data/processed/val/images")
-    parser.add_argument("--output", type=str, default="outputs/predictions")
+    parser.add_argument("--output", type=str, default="twin/outputs/predictions")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--random", action="store_true", help="Sample images randomly rather than alphabetically")
     parser.add_argument("--bdd-only", action="store_true", help="Filter for BDD100K images (exclude IDD Lite)")
-    parser.add_argument("--lane-thresh", type=float, default=0.30, help="Confidence threshold for lane extraction")
+    parser.add_argument("--lane-thresh", type=float, default=0.50, help="Confidence threshold for lane extraction")
 
     args = parser.parse_args()
 
