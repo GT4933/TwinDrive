@@ -27,6 +27,8 @@ base_paper/data/*
 # ---------------------------------------------------
 weights/
 base_paper/pretrained/
+base_paper/results/
+base_paper/test_/
 *.pt
 *.pth
 *.onnx

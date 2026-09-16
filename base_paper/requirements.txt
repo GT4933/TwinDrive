@@ -1,0 +1,11 @@
+# Trimmed to what base_paper/*.py actually imports.
+# Upstream (chequanghuy/TwinLiteNet) pins torch==1.8.0 / torchvision==0.9.0 (2021-era,
+# no RTX 50-series / Python 3.12 support). This repo's .venv already has a newer
+# CUDA 12.8 build instead (torch==2.11.0+cu128, torchvision==0.26.0+cu128) — the
+# base-paper code uses no API removed since 1.8, so it runs unmodified on it.
+torch
+torchvision
+opencv-python
+numpy
+pillow
+tqdm
