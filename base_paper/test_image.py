@@ -35,13 +35,14 @@ def Run(model,img):
 
 
 model = net.TwinLiteNet()
-model = torch.nn.DataParallel(model)
+if torch.cuda.device_count() > 1:
+    model = torch.nn.DataParallel(model)
 model = model.cuda()
 model.load_state_dict(torch.load('pretrained/best.pth'))
 model.eval()
 
 os.makedirs('images', exist_ok=True)
-image_list=os.listdir('images')
+image_list=[f for f in os.listdir('images') if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 if os.path.exists('results'):
     shutil.rmtree('results')
 os.mkdir('results')
