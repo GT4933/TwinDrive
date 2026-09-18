@@ -106,6 +106,11 @@ class TwinLiteNetDataset(Dataset):
         _, drivable_mask = cv2.threshold(drivable_mask, 127, 1, cv2.THRESH_BINARY)
         _, lanes_mask = cv2.threshold(lanes_mask, 127, 1, cv2.THRESH_BINARY)
         
+        # Determine domain validity flag for selective masked loss:
+        # BDD100K frames supervise lanes (1.0), IDD Lite frames skip lane supervision (0.0)
+        is_bdd = 0.0 if "idd_lite" in filename.lower() else 1.0
+        lane_valid_tensor = torch.tensor(is_bdd, dtype=torch.float32)
+        
         # Apply transforms safely
         if self.transform:
             augmented = self.transform(image=image, drivable=drivable_mask, lanes=lanes_mask)
@@ -125,7 +130,7 @@ class TwinLiteNetDataset(Dataset):
             drivable_tensor = torch.from_numpy(drivable_mask).long()
             lanes_tensor = torch.from_numpy(lanes_mask).long()
 
-        return image_tensor, drivable_tensor, lanes_tensor
+        return image_tensor, drivable_tensor, lanes_tensor, lane_valid_tensor
 
 def generate_mock_driving_data(target_dir, count=10, image_size=(1280, 720)):
     """
@@ -210,7 +215,7 @@ if __name__ == "__main__":
     print("\nScanning batches to verify active lane annotations...")
     found_lanes = False
     
-    for images, drivable_masks, lane_masks in train_loader:
+    for images, drivable_masks, lane_masks, lane_valids in train_loader:
         if 1 in torch.unique(lane_masks).tolist():
             found_lanes = True
             print("\n" + "-" * 40)
@@ -219,9 +224,11 @@ if __name__ == "__main__":
             print(f"Image Batch Tensor Shape (Batch, Channels, Height, Width): {images.shape}")
             print(f"Drivable Area Mask Batch Shape (Batch, Height, Width)      : {drivable_masks.shape}")
             print(f"Lane Lines Mask Batch Shape (Batch, Height, Width)         : {lane_masks.shape}")
+            print(f"Domain Flags Batch Shape (Batch)                           : {lane_valids.shape}")
             print(f"Images Value Range (Min / Max)                             : {images.min():.4f} / {images.max():.4f}")
             print(f"Drivable Mask Classes Present                              : {torch.unique(drivable_masks).tolist()}")
             print(f"Lane Mask Classes Present                                  : {torch.unique(lane_masks).tolist()}")
+            print(f"Domain Flags Present in Batch                              : {torch.unique(lane_valids).tolist()}")
             break
             
     if not found_lanes:
