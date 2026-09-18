@@ -19,8 +19,9 @@ def validation(args):
     # load the model
     model = net.TwinLiteNet()
     cuda_available = torch.cuda.is_available()
-    if cuda_available:
+    if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
+    if cuda_available:
         model = model.cuda()
         cudnn.benchmark = True
 
