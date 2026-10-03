@@ -8,8 +8,8 @@ def process_bdd100k_drivable(raw_mask_path, target_width=640, target_height=360)
     if mask is None:
         return None
         
-    # Combine main (1) and alternative (2) drivable areas into single binary mask (255)
-    drivable_binary = np.where((mask == 1) | (mask == 2), 255, 0).astype(np.uint8)
+    # Fixed: The background is black (0), so anything greater than 0 is the drivable road
+    drivable_binary = np.where(mask > 0, 255, 0).astype(np.uint8)
     drivable_resized = cv2.resize(drivable_binary, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
     return drivable_resized
 
