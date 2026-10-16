@@ -98,7 +98,6 @@ class TwinLiteNetDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Load masks in grayscale (0 to 255)
-        # Note: In case masks are saved with different extensions, look for matching filename stem
         drivable_mask = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
         lanes_mask = cv2.imread(lanes_path, cv2.IMREAD_GRAYSCALE)
         
@@ -106,12 +105,7 @@ class TwinLiteNetDataset(Dataset):
         _, drivable_mask = cv2.threshold(drivable_mask, 127, 1, cv2.THRESH_BINARY)
         _, lanes_mask = cv2.threshold(lanes_mask, 127, 1, cv2.THRESH_BINARY)
         
-        # Determine domain validity flag for selective masked loss:
-        # BDD100K frames supervise lanes (1.0), IDD Lite frames skip lane supervision (0.0)
-        is_bdd = 0.0 if "idd_lite" in filename.lower() else 1.0
-        lane_valid_tensor = torch.tensor(is_bdd, dtype=torch.float32)
-        
-        # Apply transforms safely
+        # Apply transforms safely first (in case augmentations crop out edge pixels)
         if self.transform:
             augmented = self.transform(image=image, drivable=drivable_mask, lanes=lanes_mask)
             image_tensor = augmented['image']
@@ -119,7 +113,6 @@ class TwinLiteNetDataset(Dataset):
             lanes_tensor = augmented['lanes'].long()
         else:
             # Basic fallback if Albumentations is not installed
-            # Resize manually
             h, w = self.image_size[1], self.image_size[0]
             image = cv2.resize(image, (w, h))
             drivable_mask = cv2.resize(drivable_mask, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -129,6 +122,17 @@ class TwinLiteNetDataset(Dataset):
             image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
             drivable_tensor = torch.from_numpy(drivable_mask).long()
             lanes_tensor = torch.from_numpy(lanes_mask).long()
+
+        # Determine domain validity flag for selective masked loss:
+        # - BDD100K frames always supervise lanes (1.0)
+        # - IDD Lite frames supervise lanes (1.0) ONLY if valid pseudo-label pixels exist;
+        #   blanked/rejected IDD masks skip lane supervision (0.0)
+        if "idd_lite" in filename.lower():
+            is_valid_lane = 1.0 if torch.sum(lanes_tensor) > 0 else 0.0
+        else:
+            is_valid_lane = 1.0
+            
+        lane_valid_tensor = torch.tensor(is_valid_lane, dtype=torch.float32)
 
         return image_tensor, drivable_tensor, lanes_tensor, lane_valid_tensor
 
@@ -195,10 +199,6 @@ if __name__ == "__main__":
     print("=" * 60)
     print("            TWINLITENET DATALOADER INTEGRITY TEST")
     print("=" * 60)
-    
-    # Generate mock training and validation datasets programmatically
-    # generate_mock_driving_data("data/processed/train", count=10)
-    # generate_mock_driving_data("data/processed/val", count=4)
     
     # Initialize PyTorch dataset pipelines
     print("\nInitializing PyTorch datasets...")

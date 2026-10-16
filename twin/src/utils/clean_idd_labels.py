@@ -13,7 +13,8 @@ def clean_dataset(data_split="data/processed/train"):
     files = [f for f in os.listdir(lanes_dir) if f.endswith(".png") and "idd_lite" in f]
     print(f"\nRunning Automated Sanity Check on {len(files)} IDD masks in {data_split}...")
     
-    rejected_count = 0
+    dense_count = 0
+    frag_count = 0
     
     for f in tqdm(files):
         lane_path = os.path.join(lanes_dir, f)
@@ -36,9 +37,12 @@ def clean_dataset(data_split="data/processed/train"):
             if os.path.exists(vis_path):
                 os.remove(vis_path)
                 
-            rejected_count += 1
+            if is_too_dense:
+                dense_count += 1
+            else:
+                frag_count += 1
             
-    print(f"--> Automatically rejected and blanked {rejected_count} corrupted IDD masks.")
+    print(f"--> Rejected {dense_count} dense masks and {frag_count} fragmented masks.")
 
 def sync_manual_deletions(data_split="data/processed/train"):
     lanes_dir = os.path.join(data_split, "masks_lanes")
