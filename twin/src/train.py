@@ -255,4 +255,4 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
     print("=" * 65)
 
 if __name__ == "__main__":
-    train(additional_epochs=5, batch_size=8, learning_rate=1e-4, resume_checkpoint="twin/weights/best_model.pth")
+    train(additional_epochs=10, batch_size=8, learning_rate=1e-4, resume_checkpoint="twin/weights/best_model.pth")
