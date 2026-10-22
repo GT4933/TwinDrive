@@ -14,6 +14,8 @@ try:
 except ImportError:
     ALBUMENTATIONS_AVAILABLE = False
 
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 # Set random seeds for reproducibility
 random.seed(42)
 np.random.seed(42)

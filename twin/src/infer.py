@@ -138,9 +138,15 @@ class ADASInferencePipeline:
         # Trajectory & Geometry Post-Processing
         trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask)
 
-        # Draw HUD Overlay
-        hud_frame = self.hud_visualizer.draw_hud(resized_frame, drivable_mask, lane_mask, trajectory_data, fps=fps)
+        # Use the geometrically cleaned masks for HUD rendering so sky/building/van noise is hidden
+        hud_drivable = trajectory_data.get("clean_drivable", drivable_mask)
+        hud_lanes = trajectory_data.get("clean_lanes", lane_mask)
 
+        # Draw HUD Overlay
+        hud_frame = self.hud_visualizer.draw_hud(
+            resized_frame, hud_drivable, hud_lanes, trajectory_data, fps=fps
+        )
+        
         # Upscale back to source resolution if necessary
         if (orig_w, orig_h) != (640, 360):
             hud_frame = cv2.resize(hud_frame, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)

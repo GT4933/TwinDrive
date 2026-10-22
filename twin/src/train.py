@@ -2,6 +2,8 @@ import os
 import sys
 import time
 
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 # Ensure project root directory is added to Python's module search path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -13,6 +15,18 @@ from tqdm import tqdm
 
 from src.models.twinlitenet import TwinLiteNet
 from src.utils.dataset import TwinLiteNetDataset
+
+
+def extract_binary_logits(pred_tensor):
+    """
+    Extracts unified binary logits from 1-channel or 2-channel network outputs.
+    For 2-channel outputs [B, 2, H, W], sigmoid(z1 - z0) == softmax(z)[1],
+    ensuring both channels receive gradients and match infer.py softmax evaluation.
+    """
+    if pred_tensor.shape[1] > 1:
+        return pred_tensor[:, 1, :, :] - pred_tensor[:, 0, :, :]
+    return pred_tensor.squeeze(1)
+
 
 # ---------------------------------------------------------
 # 1. Custom Imbalance Loss Module (TwinLiteLoss)
@@ -27,6 +41,7 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits, targets, reduce=True):
         probs = torch.sigmoid(logits)
+        targets = targets.float()
         
         # Calculate intersection and union per batch item (dim 1 and 2 are H and W)
         intersection = (probs * targets).sum(dim=(1, 2))
@@ -39,39 +54,45 @@ class DiceLoss(nn.Module):
             return loss.mean()
         return loss
 
+
 class TwinLiteLoss(nn.Module):
     """
     Multi-Task Loss with Domain-Gated Masking for Unlabeled Lanes.
     """
-    def __init__(self):
+    def __init__(self, lane_pos_weight=3.0):
         super(TwinLiteLoss, self).__init__()
-        # reduction='none' allows us to isolate loss per image in the batch
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.bce_drivable = nn.BCEWithLogitsLoss(reduction='none')
+        # Positive weight boosts recall on thin lane markings (<1.5% of image pixels)
+        self.register_buffer('pos_weight', torch.tensor([lane_pos_weight]))
         self.dice = DiceLoss()
 
     def forward(self, pred_drivable, pred_lanes, target_drivable, target_lanes, lane_valids=None):
-        drivable_logits = pred_drivable[:, 1, :, :] if pred_drivable.shape[1] > 1 else pred_drivable.squeeze(1)
-        lane_logits = pred_lanes[:, 1, :, :] if pred_lanes.shape[1] > 1 else pred_lanes.squeeze(1)
+        drivable_logits = extract_binary_logits(pred_drivable)
+        lane_logits = extract_binary_logits(pred_lanes)
 
         # ---------------------------------------------------
-        # Drivable Area Loss (Supervised across ALL frames)
+        # Drivable Area Loss (Supervised across valid masks)
         # ---------------------------------------------------
-        loss_drivable_bce = self.bce(drivable_logits, target_drivable.float()).mean()
-        loss_drivable_dice = self.dice(drivable_logits, target_drivable, reduce=True)
-        loss_drivable = loss_drivable_bce + loss_drivable_dice
+        drivable_valid_mask = (target_drivable.sum(dim=(1, 2)) > 0).float()
+        loss_d_bce_unreduced = self.bce_drivable(drivable_logits, target_drivable.float()).mean(dim=(1, 2))
+        loss_d_dice_unreduced = self.dice(drivable_logits, target_drivable, reduce=False)
+        loss_d_unreduced = loss_d_bce_unreduced + loss_d_dice_unreduced
+
+        d_valid_count = torch.clamp(drivable_valid_mask.sum(), min=1.0)
+        loss_drivable = (loss_d_unreduced * drivable_valid_mask).sum() / d_valid_count
 
         # ---------------------------------------------------
         # Lane Line Loss (Domain-Gated via Selective Masking)
         # ---------------------------------------------------
-        # 1. Calculate unreduced loss (Shape: [Batch_Size])
-        loss_lane_bce_unreduced = self.bce(lane_logits, target_lanes.float()).mean(dim=(1, 2))
+        pos_w = self.pos_weight.to(lane_logits.device)
+        loss_lane_bce_unreduced = nn.functional.binary_cross_entropy_with_logits(
+            lane_logits, target_lanes.float(), pos_weight=pos_w, reduction='none'
+        ).mean(dim=(1, 2))
         loss_lane_dice_unreduced = self.dice(lane_logits, target_lanes, reduce=False)
         loss_lane_unreduced = loss_lane_bce_unreduced + (1.5 * loss_lane_dice_unreduced)
 
-        # 2. Apply the domain filter
         if lane_valids is not None:
             masked_lane_loss = loss_lane_unreduced * lane_valids
-            # Prevent division by zero if entire batch happens to be IDD
             valid_count = torch.clamp(lane_valids.sum(), min=1.0)
             loss_lane = masked_lane_loss.sum() / valid_count
         else:
@@ -79,20 +100,37 @@ class TwinLiteLoss(nn.Module):
 
         return loss_drivable + loss_lane
 
+
 # ---------------------------------------------------------
-# 2. Evaluation Metrics (Intersection over Union / IoU)
+# 2. Evaluation Metrics (Domain-Aware IoU)
 # ---------------------------------------------------------
-def calculate_iou(pred_logits, targets, threshold=0.5):
-    """Calculates Mean IoU for binary segmentation mask evaluation."""
+def calculate_iou(pred_logits, targets, valid_flags=None, threshold=0.5):
+    """
+    Calculates Mean IoU strictly over valid annotated samples in the batch.
+    Returns (iou_sum, valid_sample_count) for accurate dataset-wide averaging.
+    """
     probs = torch.sigmoid(pred_logits)
     preds = (probs > threshold).float()
     targets = targets.float()
 
     intersection = (preds * targets).sum(dim=(1, 2))
     union = preds.sum(dim=(1, 2)) + targets.sum(dim=(1, 2)) - intersection
-    
-    iou = (intersection + 1e-6) / (union + 1e-6)
-    return iou.mean().item()
+    iou_per_image = (intersection + 1e-6) / (union + 1e-6)
+
+    # Only evaluate IoU on images that actually have ground-truth annotations
+    has_gt = (targets.sum(dim=(1, 2)) > 0).float()
+    if valid_flags is not None:
+        mask = has_gt * (valid_flags > 0.5).float()
+    else:
+        mask = has_gt
+
+    valid_count = mask.sum().item()
+    if valid_count == 0:
+        return 0.0, 0
+
+    iou_sum = (iou_per_image * mask).sum().item()
+    return iou_sum, valid_count
+
 
 # ---------------------------------------------------------
 # 3. Validation Pass
@@ -100,46 +138,64 @@ def calculate_iou(pred_logits, targets, threshold=0.5):
 def validate(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0.0
-    drivable_iou = 0.0
-    lane_iou = 0.0
+    
+    drivable_iou_sum = 0.0
+    drivable_valid_total = 0
+    
+    lane_iou_sum = 0.0
+    lane_valid_total = 0
 
     with torch.no_grad():
-        # Unpack the 4th item (lane_valids)
         for images, drivable_masks, lane_masks, lane_valids in val_loader:
             images = images.to(device)
             drivable_masks = drivable_masks.to(device)
             lane_masks = lane_masks.to(device)
             lane_valids = lane_valids.to(device)
 
-            # Updated AMP syntax to remove deprecation warning
             with torch.amp.autocast('cuda'):
                 pred_drivable, pred_lanes = model(images)
                 loss = criterion(pred_drivable, pred_lanes, drivable_masks, lane_masks, lane_valids)
             
             val_loss += loss.item()
 
-            d_logits = pred_drivable[:, 1, :, :] if pred_drivable.shape[1] > 1 else pred_drivable.squeeze(1)
-            l_logits = pred_lanes[:, 1, :, :] if pred_lanes.shape[1] > 1 else pred_lanes.squeeze(1)
+            d_logits = extract_binary_logits(pred_drivable)
+            l_logits = extract_binary_logits(pred_lanes)
 
-            drivable_iou += calculate_iou(d_logits, drivable_masks)
-            lane_iou += calculate_iou(l_logits, lane_masks)
+            d_sum, d_cnt = calculate_iou(d_logits, drivable_masks)
+            drivable_iou_sum += d_sum
+            drivable_valid_total += d_cnt
+
+            l_sum, l_cnt = calculate_iou(l_logits, lane_masks, valid_flags=lane_valids)
+            lane_iou_sum += l_sum
+            lane_valid_total += l_cnt
 
     num_batches = max(len(val_loader), 1)
-    return val_loss / num_batches, drivable_iou / num_batches, lane_iou / num_batches
+    avg_val_loss = val_loss / num_batches
+    avg_d_iou = drivable_iou_sum / max(drivable_valid_total, 1)
+    avg_l_iou = lane_iou_sum / max(lane_valid_total, 1)
+
+    return avg_val_loss, avg_d_iou, avg_l_iou
+
 
 # ---------------------------------------------------------
 # 4. Main Training Engine
 # ---------------------------------------------------------
-def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio=0.10, resume_checkpoint=None):
+def train(
+    additional_epochs=10,
+    batch_size=8,
+    learning_rate=1e-4,
+    val_split_ratio=0.10,
+    resume_checkpoint=None,
+    reset_best_loss=True,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 65)
     print("           TWINLITENET DUAL-HEAD TRAINING ENGINE")
     print("=" * 65)
     print(f"Target Compute Hardware : {device}")
     if torch.cuda.is_available():
-        print(f"GPU Name                 : {torch.cuda.get_device_name(0)}")
+        print(f"GPU Name                : {torch.cuda.get_device_name(0)}")
 
-    # Route weights directly to the twin subfolder
     os.makedirs("twin/weights", exist_ok=True)
 
     full_train_dataset = TwinLiteNetDataset(data_dir="data/processed/train", is_train=True)
@@ -149,20 +205,19 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
         val_size = int(len(full_train_dataset) * val_split_ratio)
         train_size = len(full_train_dataset) - val_size
         train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
-        print(f"Dataset Allocation       : {train_size} Train | {val_size} Val (Auto-split)")
+        print(f"Dataset Allocation      : {train_size} Train | {val_size} Val (Auto-split)")
     else:
         train_dataset = full_train_dataset
         val_dataset = val_dataset_disk
-        print(f"Dataset Allocation       : {len(train_dataset)} Train | {len(val_dataset)} Val")
+        print(f"Dataset Allocation      : {len(train_dataset)} Train | {len(val_dataset)} Val")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model = TwinLiteNet().to(device)
-    criterion = TwinLiteLoss()
+    criterion = TwinLiteLoss(lane_pos_weight=3.0).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Initialize AMP Scaler (Updated syntax to fix warning)
     scaler = torch.amp.GradScaler('cuda')
 
     best_val_loss = float('inf')
@@ -170,21 +225,28 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
 
     # Resume from checkpoint if specified
     if resume_checkpoint and os.path.exists(resume_checkpoint):
-        print(f"Resuming weights from    : '{resume_checkpoint}'")
+        print(f"Resuming weights from   : '{resume_checkpoint}'")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        current_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            current_epoch = checkpoint.get('epoch', 0)
+            if not reset_best_loss:
+                best_val_loss = checkpoint.get('val_loss', float('inf'))
+        else:
+            model.load_state_dict(checkpoint)
+
+        # Force the optimizer to use the fresh target learning_rate for the new schedule
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate
+            param_group['initial_lr'] = learning_rate
 
     start_epoch = current_epoch + 1
     total_target_epochs = current_epoch + additional_epochs
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_target_epochs, eta_min=1e-5)
-    
-    # Fast-forward scheduler to match the current epoch
-    for _ in range(current_epoch):
-        scheduler.step()
+    # Schedule strictly over the additional_epochs so LR starts at learning_rate and decays to eta_min
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=additional_epochs, eta_min=1e-5)
 
     print("-" * 65)
     print(f"Starting Training Run (Adding {additional_epochs} Epochs -> Targeting Epoch {total_target_epochs} | Batch Size: {batch_size})...")
@@ -198,7 +260,6 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{total_target_epochs:02d}", leave=False)
             
-            # Unpack the 4th item (lane_valids)
             for images, drivable_masks, lane_masks, lane_valids in pbar:
                 images = images.to(device)
                 drivable_masks = drivable_masks.to(device)
@@ -207,12 +268,10 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
 
                 optimizer.zero_grad()
                 
-                # Cast forward pass to mixed precision (Updated syntax)
                 with torch.amp.autocast('cuda'):
                     pred_drivable, pred_lanes = model(images)
                     loss = criterion(pred_drivable, pred_lanes, drivable_masks, lane_masks, lane_valids)
                 
-                # Scaled backward pass
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -220,6 +279,7 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
                 running_loss += loss.item()
                 pbar.set_postfix({"batch_loss": f"{loss.item():.4f}"})
 
+            # Step scheduler AFTER optimizer steps (fixes PyTorch lr_scheduler warning)
             scheduler.step()
 
             epoch_train_loss = running_loss / len(train_loader)
@@ -254,5 +314,13 @@ def train(additional_epochs=5, batch_size=8, learning_rate=1e-4, val_split_ratio
     print(f"Training Complete! Saved final model to '{latest_path}'")
     print("=" * 65)
 
+
 if __name__ == "__main__":
-    train(additional_epochs=10, batch_size=8, learning_rate=1e-4, resume_checkpoint="twin/weights/best_model.pth")
+    # Resume from latest_model.pth (Epoch 25 weights) and reset best_val_loss so best_model.pth updates
+    train(
+        additional_epochs=5,
+        batch_size=8,
+        learning_rate=1e-4,
+        resume_checkpoint="twin/weights/latest_model.pth",
+        reset_best_loss=True,
+    )
