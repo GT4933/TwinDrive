@@ -6,6 +6,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
+# Skip albumentations' online version check: on Windows every DataLoader worker re-imports this module
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 # Fallback block to safely import albumentations
 try:
     import albumentations as A
@@ -13,6 +16,9 @@ try:
     ALBUMENTATIONS_AVAILABLE = True
 except ImportError:
     ALBUMENTATIONS_AVAILABLE = False
+
+# Parallelism comes from DataLoader workers; OpenCV's own thread pool per worker only adds memory and contention
+cv2.setNumThreads(0)
 
 # Set random seeds for reproducibility
 random.seed(42)
@@ -54,7 +60,9 @@ class TwinLiteNetDataset(Dataset):
     def _get_default_transforms(self):
         """Defines basic resizing, weather simulation, and tensor conversion."""
         if not ALBUMENTATIONS_AVAILABLE:
-            return None
+            # The manual fallback skips ImageNet normalisation, which infer.py always applies,
+            # so training without albumentations would silently mismatch inference.
+            raise ImportError("albumentations is required for TwinLiteNetDataset (pip install albumentations)")
             
         height, width = self.image_size[1], self.image_size[0]
         
@@ -65,7 +73,8 @@ class TwinLiteNetDataset(Dataset):
                 # Environmental/sensor noise simulation
                 A.OneOf([
                     A.RandomRain(rain_type="heavy", brightness_coefficient=0.8, p=0.3),
-                    A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), p=0.3),
+                    # src_radius 200 (default 400 is tuned for larger frames and costs ~140 ms/img at 640x360)
+                    A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), src_radius=200, p=0.3),
                     A.GaussianBlur(blur_limit=(3, 7), p=0.3)
                 ], p=0.5),
                 A.RandomBrightnessContrast(p=0.5),

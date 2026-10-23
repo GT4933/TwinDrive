@@ -105,7 +105,7 @@ class DecoderHead(nn.Module):
     Takes the deeply encoded, low-resolution features and mathematically upsamples them 
     back to the original camera resolution (640x360) using Bilinear Interpolation.
     """
-    def __init__(self, in_channels, num_classes=2):
+    def __init__(self, in_channels, num_classes=1):
         super(DecoderHead, self).__init__()
         
         # Smooth and reduce channels before upsampling
@@ -131,17 +131,18 @@ class DecoderHead(nn.Module):
 class TwinLiteNet(nn.Module):
     """
     Complete TwinLiteNet Architecture.
-    Outputs tuple: (Drivable_Logits, Lane_Logits)
+    Outputs tuple: (Drivable_Logits, Lane_Logits), each (B, 1, H, W) raw logits.
+    Apply sigmoid to get per-pixel probabilities.
     """
-    def __init__(self, num_classes_drivable=2, num_classes_lanes=2):
+    def __init__(self):
         super(TwinLiteNet, self).__init__()
-        
+
         # Core feature extractor
         self.encoder = SharedEncoder()
-        
-        # Multi-task heads
-        self.drivable_decoder = DecoderHead(128, num_classes=num_classes_drivable)
-        self.lane_decoder = DecoderHead(128, num_classes=num_classes_lanes)
+
+        # Multi-task heads: one logit per pixel each (binary segmentation)
+        self.drivable_decoder = DecoderHead(128, num_classes=1)
+        self.lane_decoder = DecoderHead(128, num_classes=1)
 
     def forward(self, x):
         target_size = (x.size(2), x.size(3)) # Extract original Height and Width (360, 640)
@@ -184,8 +185,8 @@ if __name__ == "__main__":
     print(f"Drivable Area Output Shape : {drivable_preds.shape}")
     print(f"Lane Mask Output Shape     : {lane_preds.shape}")
     
-    assert drivable_preds.shape == (2, 2, 360, 640), "Drivable head spatial dimension mismatch!"
-    assert lane_preds.shape == (2, 2, 360, 640), "Lane head spatial dimension mismatch!"
+    assert drivable_preds.shape == (2, 1, 360, 640), "Drivable head spatial dimension mismatch!"
+    assert lane_preds.shape == (2, 1, 360, 640), "Lane head spatial dimension mismatch!"
     
     print("\nAll architecture constraints verified. Network is ready for Phase 4 (Training).")
     print("=" * 60)

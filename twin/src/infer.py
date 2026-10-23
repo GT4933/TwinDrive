@@ -85,25 +85,34 @@ class ADASInferencePipeline:
 
         # Load TwinLiteNet Model
         self.model = TwinLiteNet().to(self.device)
-        if os.path.exists(weights_path):
-            checkpoint = torch.load(weights_path, map_location=self.device)
-            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-            else:
-                self.model.load_state_dict(checkpoint)
-            print(f"  --> Successfully loaded model weights from: '{weights_path}'")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Checkpoint '{weights_path}' not found (refusing to run a randomly initialised model)")
+        checkpoint = torch.load(weights_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
         else:
-            print(f"  [Warning] Checkpoint '{weights_path}' not found! Running with initialized weights.")
+            self.model.load_state_dict(checkpoint)
+        print(f"  --> Successfully loaded model weights from: '{weights_path}'")
 
         self.model.eval()
+
+        # Warm-up: the first CUDA calls include kernel selection and memory setup, so time only after these
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 360, 640, device=self.device)
+            for _ in range(10):
+                self.model(dummy)
+        self._sync()
         self.trajectory_engine = TrajectoryEngine(image_shape=(640, 360))
         self.hud_visualizer = HUDVisualizer()
 
+    def _sync(self):
+        """CUDA runs asynchronously; wait for queued GPU work so timings measure real compute."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     def _extract_prob(self, logits):
-        """Robust activation extraction handling single-channel or multi-channel outputs."""
-        if logits.shape[1] == 1:
-            return torch.sigmoid(logits).squeeze().cpu().numpy()
-        return torch.softmax(logits, dim=1)[0, 1].cpu().numpy()
+        """Heads output (1, 1, H, W) logits; sigmoid gives per-pixel probability, returned as (H, W)."""
+        return torch.sigmoid(logits)[0, 0].float().cpu().numpy()
 
     def process_image(self, bgr_image):
         orig_h, orig_w, _ = bgr_image.shape
@@ -120,19 +129,21 @@ class ADASInferencePipeline:
 
         tensor_img = torch.from_numpy(norm_img).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
 
-        # Forward pass
-        start_time = time.time()
+        # Forward pass (model-only latency, synchronised so the GPU has actually finished)
+        self._sync()
+        start_time = time.perf_counter()
         with torch.no_grad():
             drivable_logits, lane_logits = self.model(tensor_img)
-        inference_time = time.time() - start_time
+        self._sync()
+        inference_time = time.perf_counter() - start_time
         fps = 1.0 / max(inference_time, 1e-5)
 
         # Compute Class Probabilities
         drivable_prob = self._extract_prob(drivable_logits)
         lane_prob = self._extract_prob(lane_logits)
 
-        # Thresholding (using adaptive lane threshold for early checkpoint convergence)
-        drivable_mask = (drivable_prob > 0.35).astype(np.uint8)
+        # Thresholding (0.5 = the decision boundary the loss was trained with)
+        drivable_mask = (drivable_prob > 0.5).astype(np.uint8)
         lane_mask = (lane_prob > self.lane_thresh).astype(np.uint8)
 
         # Trajectory & Geometry Post-Processing
@@ -150,15 +161,16 @@ class ADASInferencePipeline:
 
 def run_batch_inference(
     source_dir="data/processed/val/images",
-    output_dir="outputs/predictions",
+    output_dir="twin/outputs/predictions",
     max_samples=10,
     random_sample=False,
     bdd_only=False,
     lane_thresh=0.50,
+    weights_path="twin/weights/best_model.pth",
 ):
     """Runs batch inference with sampling options and configurable lane sensitivity."""
     os.makedirs(output_dir, exist_ok=True)
-    pipeline = ADASInferencePipeline(weights_path="twin/weights/best_model.pth", lane_thresh=lane_thresh)
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh)
 
     if not os.path.exists(source_dir):
         print(f"Source path '{source_dir}' does not exist!")
@@ -190,6 +202,7 @@ def run_batch_inference(
     print(f"        RUNNING ADAS TELEMETRY INFERENCE ON {len(selected_files)} FRAMES")
     print("=" * 65)
 
+    latencies = []
     for i, fname in enumerate(selected_files):
         img_path = os.path.join(source_dir, fname)
         raw_img = cv2.imread(img_path)
@@ -198,6 +211,7 @@ def run_batch_inference(
             continue
 
         annotated_frame, traj_data, fps = pipeline.process_image(raw_img)
+        latencies.append(1000.0 / fps)
 
         out_path = os.path.join(output_dir, f"hud_{fname}")
         cv2.imwrite(out_path, annotated_frame)
@@ -210,6 +224,10 @@ def run_batch_inference(
         )
 
     print("=" * 65)
+    if latencies:
+        mean_ms = sum(latencies) / len(latencies)
+        print(f"Model-only latency: {mean_ms:.2f} ms/frame mean (~{1000.0 / mean_ms:.0f} FPS), "
+              f"batch 1, fp32, {pipeline.device}")
     print(f"Inference complete! Annotated HUD frames saved inside: '{output_dir}/'")
     print("=" * 65)
 
@@ -222,6 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--random", action="store_true", help="Sample images randomly rather than alphabetically")
     parser.add_argument("--bdd-only", action="store_true", help="Filter for BDD100K images (exclude IDD Lite)")
     parser.add_argument("--lane-thresh", type=float, default=0.50, help="Confidence threshold for lane extraction")
+    parser.add_argument("--weights", type=str, default="twin/weights/best_model.pth")
 
     args = parser.parse_args()
 
@@ -232,4 +251,5 @@ if __name__ == "__main__":
         random_sample=args.random,
         bdd_only=args.bdd_only,
         lane_thresh=args.lane_thresh,
+        weights_path=args.weights,
     )

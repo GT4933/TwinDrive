@@ -17,9 +17,11 @@ def process_idd_lite_drivable(raw_mask_path, target_width=640, target_height=360
     mask = cv2.imread(raw_mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         return None
-        
-    # Map both paved road (0) and unpaved/fallback drivable surfaces (1)
-    drivable_binary = np.where((mask == 0) | (mask == 1), 255, 0).astype(np.uint8)
+
+    # IDD-Lite level-1 ids: 0 = drivable (road, parking), 1 = non-drivable (sidewalk, rail track),
+    # 2-6 = living things / vehicles / roadside objects / far objects / sky, 255 = void.
+    # Only class 0 is road.
+    drivable_binary = np.where(mask == 0, 255, 0).astype(np.uint8)
     drivable_resized = cv2.resize(drivable_binary, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
     return drivable_resized
 
@@ -62,7 +64,7 @@ def convert_split(img_dir, mask_dir, lane_dir, output_dir, split_name="train", d
     mask_map = build_filename_map(mask_dir)
     lane_map = build_filename_map(lane_dir) if lane_dir else {}
     if lane_dir and not lane_map:
-         raise FileNotFoundError(f"Lane folder '{lane_dir}' was given but contains no lane masks. "
+        raise FileNotFoundError(f"Lane folder '{lane_dir}' was given but contains no lane masks. "
                                 f"Check the path before preprocessing.")
 
     matched_stems = set(image_map.keys()).intersection(set(mask_map.keys()))
@@ -156,7 +158,6 @@ if __name__ == "__main__":
         output_dir=processed_root,
         split_name="val",
         dataset_type="bdd100k",
-        fallback_mask_root=bdd_mask_root
     )
 
     # -------------------------------------------------------------
