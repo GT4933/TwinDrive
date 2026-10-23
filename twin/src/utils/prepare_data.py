@@ -61,6 +61,9 @@ def convert_split(img_dir, mask_dir, lane_dir, output_dir, split_name="train", d
     image_map = build_filename_map(img_dir)
     mask_map = build_filename_map(mask_dir)
     lane_map = build_filename_map(lane_dir) if lane_dir else {}
+    if lane_dir and not lane_map:
+         raise FileNotFoundError(f"Lane folder '{lane_dir}' was given but contains no lane masks. "
+                                f"Check the path before preprocessing.")
 
     matched_stems = set(image_map.keys()).intersection(set(mask_map.keys()))
     
@@ -100,13 +103,15 @@ def convert_split(img_dir, mask_dir, lane_dir, output_dir, split_name="train", d
 
         # 3. Process Lane Mask (Real data for BDD100k, Zeros for IDD Lite)
         lane_mask = np.zeros((360, 640), dtype=np.uint8)
-        if dataset_type.lower() == "bdd100k" and stem in lane_map:
+        if dataset_type.lower() == "bdd100k":
+            if stem not in lane_map:
+                raise KeyError(f"No lane mask found for BDD image '{stem}'")
             raw_lane = cv2.imread(lane_map[stem], cv2.IMREAD_GRAYSCALE)
-            if raw_lane is not None:
-                lane_binary = np.where(raw_lane > 0, 255, 0).astype(np.uint8)
-                lane_mask = cv2.resize(lane_binary, (640, 360), interpolation=cv2.INTER_NEAREST)
-
-        # Save standardized outputs
+            if raw_lane is None:
+                raise IOError(f"Could not read lane mask '{lane_map[stem]}'")
+            lane_binary = np.where(raw_lane > 0, 255, 0).astype(np.uint8)
+            lane_mask = cv2.resize(lane_binary, (640, 360), interpolation=cv2.INTER_NEAREST)
+        
         cv2.imwrite(os.path.join(target_split_dir, "images", out_filename), img_resized)
         cv2.imwrite(os.path.join(target_split_dir, "masks_drivable", out_filename), drivable_mask)
         cv2.imwrite(os.path.join(target_split_dir, "masks_lanes", out_filename), lane_mask)
@@ -127,11 +132,11 @@ if __name__ == "__main__":
     # 1. BDD100K Dataset Parsing
     # -------------------------------------------------------------
     print("\n[1/2] Scanning BDD100K Directory Tree...")
-    bdd_img_root = os.path.join(base_raw, "bdd100k_images_10k", "10k")
-    
-    # Use bdd_seg_gt directly since it has clean train/val folders
-    bdd_mask_root = os.path.join(base_raw, "bdd_seg_gt") if os.path.exists(os.path.join(base_raw, "bdd_seg_gt")) else os.path.join(base_raw, "bdd100k_drivable_maps", "labels")
-    bdd_lane_root = os.path.join(base_raw, "bdd_lane_gt")
+    # BDD100K: full 100K split (70k train / 10k val), same source the base paper uses.
+    bdd_root = "datasets"
+    bdd_img_root = os.path.join(bdd_root, "100k")
+    bdd_mask_root = os.path.join(bdd_root, "bdd_seg_gt")
+    bdd_lane_root = os.path.join(bdd_root, "bdd_lane_gt")
 
     # Train Split
     convert_split(
@@ -141,7 +146,6 @@ if __name__ == "__main__":
         output_dir=processed_root,
         split_name="train",
         dataset_type="bdd100k",
-        fallback_mask_root=bdd_mask_root
     )
 
     # Validation Split
