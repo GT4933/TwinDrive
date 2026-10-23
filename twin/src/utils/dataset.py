@@ -31,22 +31,30 @@ class TwinLiteNetDataset(Dataset):
     Reads images, drivable area masks, and lane masks.
     Applies real-time spatial and pixel-level augmentations.
     """
-    def __init__(self, data_dir, image_size=(640, 360), is_train=True, transform=None):
+    def __init__(self, data_dir, image_size=(640, 360), is_train=True, transform=None,
+                 with_ego=False, geometric_aug=False):
         """
         Args:
             data_dir (str): Path to either 'data/processed/train' or 'data/processed/val'
             image_size (tuple): Format (width, height) to resize inputs
             is_train (bool): Active state for training augmentations
             transform (albumentations.Compose): Custom transforms to apply
+            with_ego (bool): Also return the ego-lane mask from masks_ego/ (built by make_ego_masks.py)
+            geometric_aug (bool): Add random scale/shift/rotate (like the base paper's random_perspective)
         """
         self.data_dir = data_dir
         self.image_size = image_size
         self.is_train = is_train
-        
+        self.with_ego = with_ego
+        self.geometric_aug = geometric_aug
+
         # Define paths to files
         self.img_dir = os.path.join(data_dir, "images")
         self.drivable_dir = os.path.join(data_dir, "masks_drivable")
         self.lanes_dir = os.path.join(data_dir, "masks_lanes")
+        self.ego_dir = os.path.join(data_dir, "masks_ego")
+        if with_ego and not os.path.isdir(self.ego_dir):
+            raise FileNotFoundError(f"'{self.ego_dir}' not found; run twin/src/utils/make_ego_masks.py first")
         
         # Load and align all filenames
         self.filenames = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -65,11 +73,18 @@ class TwinLiteNetDataset(Dataset):
             raise ImportError("albumentations is required for TwinLiteNetDataset (pip install albumentations)")
             
         height, width = self.image_size[1], self.image_size[0]
-        
+        targets = {'drivable': 'mask', 'lanes': 'mask', 'ego': 'mask'}
+
         if self.is_train:
+            # Geometric variety: the same affine warp is applied to the image and every mask
+            # (masks use nearest-neighbour, so labels stay strictly 0/1)
+            geometric = [A.Affine(scale=(0.75, 1.25), translate_percent=(-0.1, 0.1), rotate=(-10, 10),
+                                  border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5)] \
+                if self.geometric_aug else []
             # Training augmentations simulating rain, lens flare, and camera noise
             return A.Compose([
                 A.Resize(height, width),
+                *geometric,
                 # Environmental/sensor noise simulation
                 A.OneOf([
                     A.RandomRain(rain_type="heavy", brightness_coefficient=0.8, p=0.3),
@@ -82,14 +97,14 @@ class TwinLiteNetDataset(Dataset):
                 # Standard normalization (ImageNet distribution)
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
-            ], additional_targets={'drivable': 'mask', 'lanes': 'mask'})
+            ], additional_targets=targets)
         else:
             # Simple resizing and normalization for validation
             return A.Compose([
                 A.Resize(height, width),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
-            ], additional_targets={'drivable': 'mask', 'lanes': 'mask'})
+            ], additional_targets=targets)
 
     def __len__(self):
         return len(self.filenames)
@@ -122,10 +137,17 @@ class TwinLiteNetDataset(Dataset):
         
         # Apply transforms safely
         if self.transform:
-            augmented = self.transform(image=image, drivable=drivable_mask, lanes=lanes_mask)
+            masks = {'drivable': drivable_mask, 'lanes': lanes_mask}
+            if self.with_ego:
+                ego_mask = cv2.imread(os.path.join(self.ego_dir, filename), cv2.IMREAD_GRAYSCALE)
+                _, masks['ego'] = cv2.threshold(ego_mask, 127, 1, cv2.THRESH_BINARY)
+            augmented = self.transform(image=image, **masks)
             image_tensor = augmented['image']
             drivable_tensor = augmented['drivable'].long()
             lanes_tensor = augmented['lanes'].long()
+            if self.with_ego:
+                # Ego lane uses the same domain gate as lanes (IDD has no own-lane labels)
+                return image_tensor, drivable_tensor, lanes_tensor, lane_valid_tensor, augmented['ego'].long()
         else:
             # Basic fallback if Albumentations is not installed
             # Resize manually

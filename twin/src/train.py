@@ -19,8 +19,11 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v2 import TwinDriveV2
 from src.utils.dataset import TwinLiteNetDataset
 from src.utils.metrics import BinarySegMetric
+
+ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2}
 
 # ---------------------------------------------------------
 # 1. Custom Imbalance Loss Module (TwinLiteLoss)
@@ -47,87 +50,143 @@ class DiceLoss(nn.Module):
             return loss.mean()
         return loss
 
+class TverskyLoss(nn.Module):
+    """
+    Per-image soft Tversky loss: 1 - TP / (TP + alpha*FP + beta*FN).
+    alpha > beta penalises false positives more (raises precision); alpha = beta = 0.5 is Dice.
+    """
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1.0):
+        super(TverskyLoss, self).__init__()
+        self.alpha, self.beta, self.smooth = alpha, beta, smooth
+
+    def forward(self, logits, targets, reduce=True):
+        probs = torch.sigmoid(logits)
+        targets = targets.float()
+        tp = (probs * targets).sum(dim=(1, 2))
+        fp = (probs * (1 - targets)).sum(dim=(1, 2))
+        fn = ((1 - probs) * targets).sum(dim=(1, 2))
+        loss = 1. - (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        return loss.mean() if reduce else loss
+
 class TwinLiteLoss(nn.Module):
     """
     Multi-Task Loss with Domain-Gated Masking for Unlabeled Lanes.
+    Returns a dict of per-task losses; TaskWeighting combines them into one number.
     """
-    def __init__(self):
+    def __init__(self, lane_loss="dice"):
         super(TwinLiteLoss, self).__init__()
         # reduction='none' allows us to isolate loss per image in the batch
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.dice = DiceLoss()
+        self.lane_overlap = TverskyLoss() if lane_loss == "tversky" else self.dice
 
-    def forward(self, pred_drivable, pred_lanes, target_drivable, target_lanes, lane_valids=None):
+    def _gated(self, logits, targets, valids, overlap, overlap_weight):
+        """Per-image BCE + overlap loss, averaged over the images whose labels exist (valids == 1)."""
+        per_image = self.bce(logits, targets.float()).mean(dim=(1, 2)) + overlap_weight * overlap(logits, targets, reduce=False)
+        if valids is None:
+            return per_image.mean()
+        # Prevent division by zero if entire batch happens to be IDD
+        return (per_image * valids).sum() / torch.clamp(valids.sum(), min=1.0)
+
+    def forward(self, pred_drivable, pred_lanes, target_drivable, target_lanes, lane_valids=None,
+                pred_ego=None, target_ego=None):
         # Heads output (B, 1, H, W) logits; drop the channel dim to match (B, H, W) targets
         drivable_logits = pred_drivable.squeeze(1)
-        lane_logits = pred_lanes.squeeze(1)
 
         # ---------------------------------------------------
         # Drivable Area Loss (Supervised across ALL frames)
         # ---------------------------------------------------
         loss_drivable_bce = self.bce(drivable_logits, target_drivable.float()).mean()
         loss_drivable_dice = self.dice(drivable_logits, target_drivable, reduce=True)
-        loss_drivable = loss_drivable_bce + loss_drivable_dice
+        losses = {"drivable": loss_drivable_bce + loss_drivable_dice}
 
         # ---------------------------------------------------
         # Lane Line Loss (Domain-Gated via Selective Masking)
         # ---------------------------------------------------
-        # 1. Calculate unreduced loss (Shape: [Batch_Size])
-        loss_lane_bce_unreduced = self.bce(lane_logits, target_lanes.float()).mean(dim=(1, 2))
-        loss_lane_dice_unreduced = self.dice(lane_logits, target_lanes, reduce=False)
-        loss_lane_unreduced = loss_lane_bce_unreduced + (1.5 * loss_lane_dice_unreduced)
+        losses["lane"] = self._gated(pred_lanes.squeeze(1), target_lanes, lane_valids, self.lane_overlap, 1.5)
 
-        # 2. Apply the domain filter
-        if lane_valids is not None:
-            masked_lane_loss = loss_lane_unreduced * lane_valids
-            # Prevent division by zero if entire batch happens to be IDD
-            valid_count = torch.clamp(lane_valids.sum(), min=1.0)
-            loss_lane = masked_lane_loss.sum() / valid_count
-        else:
-            loss_lane = loss_lane_unreduced.mean()
+        # Ego lane (BDD "direct" area): same domain gate, since IDD has no own-lane labels
+        if pred_ego is not None:
+            losses["ego"] = self._gated(pred_ego.squeeze(1), target_ego, lane_valids, self.dice, 1.0)
+        return losses
 
-        return loss_drivable + loss_lane
+class TaskWeighting(nn.Module):
+    """
+    'fixed': plain sum of task losses (the original recipe).
+    'uncertainty': Kendall et al. (2018) learned weighting, total = sum(exp(-s_t) * L_t + s_t), where s_t is a
+    learned log-variance per task; tasks that stay noisy get down-weighted automatically.
+    """
+    def __init__(self, tasks, mode="fixed"):
+        super(TaskWeighting, self).__init__()
+        self.mode = mode
+        self.tasks = list(tasks)
+        if mode == "uncertainty":
+            self.log_vars = nn.Parameter(torch.zeros(len(self.tasks)))
+
+    def forward(self, losses):
+        if self.mode == "fixed":
+            return sum(losses[t] for t in self.tasks)
+        return sum(torch.exp(-self.log_vars[i]) * losses[t] + self.log_vars[i] for i, t in enumerate(self.tasks))
+
+    def weights(self):
+        if self.mode == "fixed":
+            return {t: 1.0 for t in self.tasks}
+        return {t: float(torch.exp(-self.log_vars[i])) for i, t in enumerate(self.tasks)}
+
+def unpack(batch, device):
+    """(images, drivable, lanes, lane_valids, ego-or-None) on device; ego exists only for with_ego datasets."""
+    images, drivable, lanes, valids = (t.to(device, non_blocking=True) for t in batch[:4])
+    ego = batch[4].to(device, non_blocking=True) if len(batch) > 4 else None
+    return images, drivable, lanes, valids, ego
+
+def compute_losses(model, criterion, images, drivable, lanes, valids, ego):
+    outputs = model(images)
+    pred_ego = outputs[2] if len(outputs) > 2 else None
+    return outputs, criterion(outputs[0], outputs[1], drivable, lanes, valids, pred_ego, ego)
 
 # ---------------------------------------------------------
 # 2. Validation Pass (dataset-level metrics, reported per domain)
 # ---------------------------------------------------------
-def validate(model, val_loader, criterion, device, threshold=0.5):
+def validate(model, val_loader, criterion, weighting, device, threshold=0.5):
     """
     Returns (mean val loss, metrics dict). Confusion matrices are accumulated over the whole
-    val set and split by domain: lanes are scored on BDD frames only (IDD has no lane labels).
+    val set and split by domain: lanes (and ego lane) are scored on BDD frames only.
     """
     model.eval()
     val_loss = 0.0
-    da_bdd, da_idd, ll_bdd = BinarySegMetric(), BinarySegMetric(), BinarySegMetric()
+    da_bdd, da_idd, ll_bdd, ego_bdd = BinarySegMetric(), BinarySegMetric(), BinarySegMetric(), BinarySegMetric()
 
     with torch.no_grad():
-        for images, drivable_masks, lane_masks, lane_valids in val_loader:
-            images = images.to(device)
-            drivable_masks = drivable_masks.to(device)
-            lane_masks = lane_masks.to(device)
-            lane_valids = lane_valids.to(device)
+        for batch in val_loader:
+            images, drivable_masks, lane_masks, lane_valids, ego_masks = unpack(batch, device)
 
             with torch.amp.autocast(device.type, enabled=device.type == "cuda"):
-                pred_drivable, pred_lanes = model(images)
-                loss = criterion(pred_drivable, pred_lanes, drivable_masks, lane_masks, lane_valids)
+                outputs, losses = compute_losses(model, criterion, images, drivable_masks, lane_masks, lane_valids, ego_masks)
+                loss = weighting(losses)
             val_loss += loss.item()
 
-            d_pred = torch.sigmoid(pred_drivable.squeeze(1).float()) > threshold
-            l_pred = torch.sigmoid(pred_lanes.squeeze(1).float()) > threshold
+            d_pred = torch.sigmoid(outputs[0].squeeze(1).float()) > threshold
+            l_pred = torch.sigmoid(outputs[1].squeeze(1).float()) > threshold
 
             is_bdd = lane_valids > 0.5
             if is_bdd.any():
                 da_bdd.update(d_pred[is_bdd], drivable_masks[is_bdd])
                 ll_bdd.update(l_pred[is_bdd], lane_masks[is_bdd])
+                if ego_masks is not None:
+                    e_pred = torch.sigmoid(outputs[2].squeeze(1).float()) > threshold
+                    ego_bdd.update(e_pred[is_bdd], ego_masks[is_bdd])
             if (~is_bdd).any():
                 da_idd.update(d_pred[~is_bdd], drivable_masks[~is_bdd])
 
+    nan = float("nan")
     metrics = {
-        "bdd_da_miou": da_bdd.miou() if da_bdd.num_pixels() else float("nan"),
-        "bdd_ll_iou": ll_bdd.iou() if ll_bdd.num_pixels() else float("nan"),
-        "bdd_ll_recall": ll_bdd.recall() if ll_bdd.num_pixels() else float("nan"),
-        "idd_da_miou": da_idd.miou() if da_idd.num_pixels() else float("nan"),
+        "bdd_da_miou": da_bdd.miou() if da_bdd.num_pixels() else nan,
+        "bdd_ll_iou": ll_bdd.iou() if ll_bdd.num_pixels() else nan,
+        "bdd_ll_recall": ll_bdd.recall() if ll_bdd.num_pixels() else nan,
+        "idd_da_miou": da_idd.miou() if da_idd.num_pixels() else nan,
     }
+    if ego_bdd.num_pixels():
+        metrics["bdd_ego_miou"] = ego_bdd.miou()
     return val_loss / max(len(val_loader), 1), metrics
 
 def selection_score(metrics):
@@ -147,17 +206,22 @@ def subset(dataset, max_samples, seed=0):
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
+    with_ego = args.arch == "v2"
     print("=" * 65)
     print("           TWINLITENET DUAL-HEAD TRAINING ENGINE")
     print("=" * 65)
     print(f"Target Compute Hardware : {device}")
     if torch.cuda.is_available():
         print(f"GPU Name                 : {torch.cuda.get_device_name(0)}")
+    print(f"Architecture             : {args.arch} | lane loss {args.lane_loss} | weighting {args.task_weighting} "
+          f"| geometric aug {args.geometric_aug}")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    train_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/train", is_train=True), args.max_train_samples)
-    val_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/val", is_train=False), args.max_val_samples)
+    train_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/train", is_train=True, with_ego=with_ego,
+                                              geometric_aug=args.geometric_aug), args.max_train_samples)
+    val_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/val", is_train=False, with_ego=with_ego),
+                         args.max_val_samples)
     print(f"Dataset Allocation       : {len(train_dataset)} Train | {len(val_dataset)} Val")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -168,9 +232,12 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=val_workers, pin_memory=True)
 
-    model = TwinLiteNet().to(device)
-    criterion = TwinLiteLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    model = ARCHS[args.arch]().to(device)
+    print(f"Model Parameters         : {sum(p.numel() for p in model.parameters()):,}")
+    criterion = TwinLiteLoss(lane_loss=args.lane_loss)
+    tasks = ["drivable", "lane"] + (["ego"] if with_ego else [])
+    weighting = TaskWeighting(tasks, mode=args.task_weighting).to(device)
+    optimizer = optim.AdamW(list(model.parameters()) + list(weighting.parameters()), lr=args.lr, weight_decay=1e-4)
     # One fixed schedule over the whole run; its state is checkpointed so resuming continues the same curve
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
@@ -186,14 +253,17 @@ def train(args):
             raise FileNotFoundError(f"Resume checkpoint '{args.resume}' not found")
         print(f"Resuming from            : '{args.resume}'")
         checkpoint = torch.load(args.resume, map_location=device)
-        saved_epochs = checkpoint['args']['epochs']
-        if saved_epochs != args.epochs:
-            raise ValueError(f"Checkpoint was trained with --epochs {saved_epochs}; resuming with --epochs "
-                             f"{args.epochs} would distort the LR schedule. Pass --epochs {saved_epochs}.")
+        for key in ("epochs", "arch"):
+            saved = checkpoint['args'].get(key, "v1" if key == "arch" else None)
+            if saved != getattr(args, key):
+                raise ValueError(f"Checkpoint was trained with --{key} {saved}; resuming with --{key} "
+                                 f"{getattr(args, key)} would not continue the same run. Pass --{key} {saved}.")
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        if 'weighting_state_dict' in checkpoint:
+            weighting.load_state_dict(checkpoint['weighting_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_score = checkpoint.get('best_score', -1.0)
     elif os.path.exists(log_path):
@@ -211,18 +281,15 @@ def train(args):
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{args.epochs:02d}", leave=False)
 
-            for images, drivable_masks, lane_masks, lane_valids in pbar:
-                images = images.to(device, non_blocking=True)
-                drivable_masks = drivable_masks.to(device, non_blocking=True)
-                lane_masks = lane_masks.to(device, non_blocking=True)
-                lane_valids = lane_valids.to(device, non_blocking=True)
+            for batch in pbar:
+                images, drivable_masks, lane_masks, lane_valids, ego_masks = unpack(batch, device)
 
                 optimizer.zero_grad()
 
                 # Cast forward pass to mixed precision
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    pred_drivable, pred_lanes = model(images)
-                    loss = criterion(pred_drivable, pred_lanes, drivable_masks, lane_masks, lane_valids)
+                    _, losses = compute_losses(model, criterion, images, drivable_masks, lane_masks, lane_valids, ego_masks)
+                    loss = weighting(losses)
 
                 # Scaled backward pass
                 scaler.scale(loss).backward()
@@ -235,14 +302,17 @@ def train(args):
             scheduler.step()
 
             epoch_train_loss = running_loss / len(train_loader)
-            val_loss, m = validate(model, val_loader, criterion, device)
+            val_loss, m = validate(model, val_loader, criterion, weighting, device)
             score = selection_score(m)
             elapsed = time.time() - start_time
 
+            ego_str = f" | BDD Ego mIoU: {m['bdd_ego_miou']:.4f}" if "bdd_ego_miou" in m else ""
             print(f"Epoch [{epoch:02d}/{args.epochs:02d}] ({elapsed:.1f}s) | "
                   f"Train Loss: {epoch_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"BDD DA mIoU: {m['bdd_da_miou']:.4f} | BDD Lane IoU: {m['bdd_ll_iou']:.4f} | "
-                  f"BDD Lane Recall: {m['bdd_ll_recall']:.4f} | IDD DA mIoU: {m['idd_da_miou']:.4f}")
+                  f"BDD Lane Recall: {m['bdd_ll_recall']:.4f} | IDD DA mIoU: {m['idd_da_miou']:.4f}{ego_str}")
+            if args.task_weighting == "uncertainty":
+                print("  task weights: " + ", ".join(f"{t} {w:.3f}" for t, w in weighting.weights().items()))
 
             with open(log_path, "a", newline="") as f:
                 writer = csv.writer(f)
@@ -259,6 +329,7 @@ def train(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
+                'weighting_state_dict': weighting.state_dict(),
                 'val_loss': val_loss,
                 'metrics': m,
                 'best_score': best_score,
@@ -278,12 +349,18 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TwinDrive (dual-head drivable + lane segmentation)")
+    parser.add_argument("--arch", choices=sorted(ARCHS), default="v1",
+                        help="v1 = original TwinDrive; v2 = skip decoders, stride 8, HFF, coordinate attention, ego head")
     parser.add_argument("--epochs", type=int, default=30, help="Total epochs for the run (cosine schedule length)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak LR (matches the base paper's 5e-4)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default="twin/weights")
     parser.add_argument("--resume", type=str, default="", help="Path to latest_model.pth to continue a run")
+    parser.add_argument("--lane-loss", choices=["dice", "tversky"], default="dice",
+                        help="Overlap term of the lane loss (tversky uses alpha=0.7 on FP, beta=0.3 on FN)")
+    parser.add_argument("--task-weighting", choices=["fixed", "uncertainty"], default="fixed")
+    parser.add_argument("--geometric-aug", action="store_true", help="Random scale/shift/rotate augmentation")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Random subset size, for smoke tests")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Random subset size, for smoke tests")
     train(parser.parse_args())

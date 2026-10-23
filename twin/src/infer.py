@@ -12,7 +12,10 @@ import torch.nn.functional as F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v2 import TwinDriveV2
 from src.postprocess.trajectory import TrajectoryEngine
+
+ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2}
 
 
 class HUDVisualizer:
@@ -20,7 +23,7 @@ class HUDVisualizer:
     def __init__(self, alpha=0.45):
         self.alpha = alpha
 
-    def draw_hud(self, frame, drivable_mask, lane_mask, trajectory_data, fps=0.0):
+    def draw_hud(self, frame, drivable_mask, lane_mask, trajectory_data, fps=0.0, ego_mask=None):
         height, width, _ = frame.shape
         overlay = frame.copy()
 
@@ -28,6 +31,12 @@ class HUDVisualizer:
         green_mask = np.zeros_like(frame)
         green_mask[drivable_mask > 0] = [0, 210, 80]  # BGR Emerald Green
         cv2.addWeighted(green_mask, self.alpha, overlay, 1.0, 0, overlay)
+
+        # 1b. Blue tint over the predicted ego lane (v2 models only)
+        if ego_mask is not None:
+            ego_overlay = np.zeros_like(frame)
+            ego_overlay[ego_mask > 0] = [200, 90, 0]  # BGR Blue
+            cv2.addWeighted(ego_overlay, 0.5, overlay, 1.0, 0, overlay)
 
         # 2. Distinct Red/Magenta overlay for segmented lane markings
         lane_overlay = np.zeros_like(frame)
@@ -78,21 +87,23 @@ class HUDVisualizer:
 
 class ADASInferencePipeline:
     """Executes end-to-end model inference, trajectory post-processing, and HUD generation."""
-    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50):
+    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50, ema_alpha=0.0):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lane_thresh = lane_thresh
         print(f"\nInitializing ADAS Pipeline on Hardware: {self.device}")
 
-        # Load TwinLiteNet Model
-        self.model = TwinLiteNet().to(self.device)
         if not os.path.exists(weights_path):
             raise FileNotFoundError(f"Checkpoint '{weights_path}' not found (refusing to run a randomly initialised model)")
         checkpoint = torch.load(weights_path, map_location=self.device)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+            # Training checkpoints record their architecture; older ones predate v2 and are v1
+            arch = checkpoint.get("args", {}).get("arch", "v1")
+            state = checkpoint["model_state_dict"]
         else:
-            self.model.load_state_dict(checkpoint)
-        print(f"  --> Successfully loaded model weights from: '{weights_path}'")
+            arch, state = "v1", checkpoint
+        self.model = ARCHS[arch]().to(self.device)
+        self.model.load_state_dict(state)
+        print(f"  --> Successfully loaded {arch} model weights from: '{weights_path}'")
 
         self.model.eval()
 
@@ -102,7 +113,7 @@ class ADASInferencePipeline:
             for _ in range(10):
                 self.model(dummy)
         self._sync()
-        self.trajectory_engine = TrajectoryEngine(image_shape=(640, 360))
+        self.trajectory_engine = TrajectoryEngine(image_shape=(640, 360), ema_alpha=ema_alpha)
         self.hud_visualizer = HUDVisualizer()
 
     def _sync(self):
@@ -133,24 +144,28 @@ class ADASInferencePipeline:
         self._sync()
         start_time = time.perf_counter()
         with torch.no_grad():
-            drivable_logits, lane_logits = self.model(tensor_img)
+            outputs = self.model(tensor_img)
         self._sync()
         inference_time = time.perf_counter() - start_time
         fps = 1.0 / max(inference_time, 1e-5)
 
         # Compute Class Probabilities
-        drivable_prob = self._extract_prob(drivable_logits)
-        lane_prob = self._extract_prob(lane_logits)
+        drivable_prob = self._extract_prob(outputs[0])
+        lane_prob = self._extract_prob(outputs[1])
 
         # Thresholding (0.5 = the decision boundary the loss was trained with)
         drivable_mask = (drivable_prob > 0.5).astype(np.uint8)
         lane_mask = (lane_prob > self.lane_thresh).astype(np.uint8)
+        # v2 also predicts the ego lane; keep it inside the drivable area
+        ego_mask = ((self._extract_prob(outputs[2]) > 0.5) & (drivable_mask > 0)).astype(np.uint8) \
+            if len(outputs) > 2 else None
 
         # Trajectory & Geometry Post-Processing
-        trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask)
+        trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask, ego_mask)
 
         # Draw HUD Overlay
-        hud_frame = self.hud_visualizer.draw_hud(resized_frame, drivable_mask, lane_mask, trajectory_data, fps=fps)
+        hud_frame = self.hud_visualizer.draw_hud(resized_frame, drivable_mask, lane_mask, trajectory_data, fps=fps,
+                                                 ego_mask=ego_mask)
 
         # Upscale back to source resolution if necessary
         if (orig_w, orig_h) != (640, 360):
@@ -232,6 +247,41 @@ def run_batch_inference(
     print("=" * 65)
 
 
+def run_video_inference(video_path, output_path, weights_path="twin/weights/best_model.pth", lane_thresh=0.50,
+                        ema_alpha=0.4):
+    """Runs the HUD over a video; consecutive frames are temporally smoothed (ema_alpha = weight of the newest frame)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video '{video_path}'")
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, ema_alpha=ema_alpha)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    writer, latencies, modes = None, [], {}
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        annotated, traj_data, fps = pipeline.process_image(frame)
+        if writer is None:
+            h, w = annotated.shape[:2]
+            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps_in, (w, h))
+        writer.write(annotated)
+        latencies.append(1000.0 / fps)
+        modes[traj_data["mode"]] = modes.get(traj_data["mode"], 0) + 1
+    cap.release()
+    if writer is not None:
+        writer.release()
+
+    print("=" * 65)
+    if latencies:
+        mean_ms = sum(latencies) / len(latencies)
+        print(f"{len(latencies)} frames | model-only latency {mean_ms:.2f} ms/frame (~{1000.0 / mean_ms:.0f} FPS)")
+        print("Modes: " + ", ".join(f"{m} {n}" for m, n in modes.items()))
+    print(f"Annotated video saved to '{output_path}'")
+    print("=" * 65)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TwinLiteNet Real-Time ADAS Telemetry Engine")
     parser.add_argument("--source", type=str, default="data/processed/val/images")
@@ -241,8 +291,17 @@ if __name__ == "__main__":
     parser.add_argument("--bdd-only", action="store_true", help="Filter for BDD100K images (exclude IDD Lite)")
     parser.add_argument("--lane-thresh", type=float, default=0.50, help="Confidence threshold for lane extraction")
     parser.add_argument("--weights", type=str, default="twin/weights/best_model.pth")
+    parser.add_argument("--video", type=str, default=None, help="Process a video file instead of images")
+    parser.add_argument("--smooth", type=float, default=0.4,
+                        help="Video only: EMA weight of the newest frame for the trajectory (0 = no smoothing)")
 
     args = parser.parse_args()
+
+    if args.video:
+        out = args.output if args.output.lower().endswith(".mp4") else os.path.join(args.output, "hud_video.mp4")
+        run_video_inference(args.video, out, weights_path=args.weights, lane_thresh=args.lane_thresh,
+                            ema_alpha=args.smooth)
+        sys.exit(0)
 
     run_batch_inference(
         source_dir=args.source,
