@@ -213,6 +213,100 @@ def run_batch_inference(
     print(f"Inference complete! Annotated HUD frames saved inside: '{output_dir}/'")
     print("=" * 65)
 
+def run_video_inference(
+    source="0",
+    output_path=None,
+    show=False,
+    max_frames=None,
+    lane_thresh=0.50,
+    weights_path="twin/weights/best_model.pth",
+):
+    """Runs the ADAS pipeline frame-by-frame on a video file or webcam.
+
+    source      : path to a video file, or a camera index such as "0" for a webcam.
+    output_path : where to save the annotated .mp4 (None -> auto-named in twin/outputs/videos/).
+    show        : open a live preview window (press 'q' or ESC to stop).
+    max_frames  : stop after N frames (handy for quick tests).
+    """
+    is_webcam = str(source).isdigit()
+    cap = cv2.VideoCapture(int(source) if is_webcam else source)
+    if not cap.isOpened():
+        print(f"Could not open video source '{source}'!")
+        return
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not src_fps or src_fps != src_fps or src_fps <= 0:  # 0 / NaN on some webcams
+        src_fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_webcam else 0
+
+    if output_path is None:
+        name = "webcam" if is_webcam else os.path.splitext(os.path.basename(source))[0]
+        output_path = os.path.join("twin/outputs/videos", f"{name}_hud.mp4")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), src_fps, (width, height))
+    if not writer.isOpened():
+        print(f"Could not open VideoWriter for '{output_path}' (codec problem?).")
+        cap.release()
+        return
+
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh)
+
+    print("=" * 65)
+    print(f"        RUNNING ADAS VIDEO INFERENCE: {source}")
+    print(f"        {width}x{height} @ {src_fps:.1f} FPS" + (f" | {total} frames" if total else ""))
+    print("=" * 65)
+
+    frame_idx = 0
+    infer_fps_sum = 0.0
+    t_start = time.time()
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break  # end of file / camera dropped
+
+            annotated, traj_data, fps = pipeline.process_image(frame)
+            writer.write(annotated)
+
+            frame_idx += 1
+            infer_fps_sum += fps
+
+            if frame_idx % 30 == 0 or frame_idx == 1:
+                progress = f"{frame_idx}/{total}" if total else f"{frame_idx}"
+                print(
+                    f"[{progress}] Speed: {fps:.1f} FPS | Mode: {traj_data['mode']} | "
+                    f"Offset: {traj_data['offset_cm']:.1f} cm ({traj_data['direction']})"
+                )
+
+            if show:
+                cv2.imshow("TwinDrive ADAS HUD (q / ESC to quit)", annotated)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    print("Stopped by user.")
+                    break
+
+            if max_frames and frame_idx >= max_frames:
+                break
+    except KeyboardInterrupt:
+        print("Interrupted by user - saving what has been processed so far.")
+    finally:
+        cap.release()
+        writer.release()
+        if show:
+            cv2.destroyAllWindows()
+
+    elapsed = max(time.time() - t_start, 1e-5)
+    print("=" * 65)
+    if frame_idx:
+        print(f"Processed {frame_idx} frames in {elapsed:.1f}s "
+              f"(end-to-end {frame_idx / elapsed:.1f} FPS, "
+              f"avg model-only {infer_fps_sum / frame_idx:.1f} FPS)")
+    print(f"Annotated video saved to: '{output_path}'")
+    print("=" * 65)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TwinLiteNet Real-Time ADAS Telemetry Engine")
@@ -222,8 +316,23 @@ if __name__ == "__main__":
     parser.add_argument("--random", action="store_true", help="Sample images randomly rather than alphabetically")
     parser.add_argument("--bdd-only", action="store_true", help="Filter for BDD100K images (exclude IDD Lite)")
     parser.add_argument("--lane-thresh", type=float, default=0.50, help="Confidence threshold for lane extraction")
+    parser.add_argument("--video", type=str, default=None, help="Path to an input video file (runs video mode)")
+    parser.add_argument("--webcam", action="store_true", help="Use webcam (camera index 0) as the video source")
+    parser.add_argument("--video-out", type=str, default=None, help="Output path for the annotated .mp4")
+    parser.add_argument("--show", action="store_true", help="Show a live preview window while processing video")
+    parser.add_argument("--max-frames", type=int, default=None, help="Stop after N frames (quick tests)")
 
     args = parser.parse_args()
+
+    if args.video or args.webcam:
+        run_video_inference(
+            source="0" if args.webcam else args.video,
+            output_path=args.video_out,
+            show=args.show,
+            max_frames=args.max_frames,
+            lane_thresh=args.lane_thresh,
+        )
+        sys.exit(0)
 
     run_batch_inference(
         source_dir=args.source,
