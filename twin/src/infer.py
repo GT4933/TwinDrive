@@ -87,9 +87,12 @@ class HUDVisualizer:
 
 class ADASInferencePipeline:
     """Executes end-to-end model inference, trajectory post-processing, and HUD generation."""
-    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50, ema_alpha=0.0):
+    def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50, ema_alpha=0.0,
+                 use_ego=False):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lane_thresh = lane_thresh
+        # v2's ego-lane head is opt-in: by default the HUD and trajectory use only drivable area + lanes
+        self.use_ego = use_ego
         print(f"\nInitializing ADAS Pipeline on Hardware: {self.device}")
 
         if not os.path.exists(weights_path):
@@ -158,7 +161,7 @@ class ADASInferencePipeline:
         lane_mask = (lane_prob > self.lane_thresh).astype(np.uint8)
         # v2 also predicts the ego lane; keep it inside the drivable area
         ego_mask = ((self._extract_prob(outputs[2]) > 0.5) & (drivable_mask > 0)).astype(np.uint8) \
-            if len(outputs) > 2 else None
+            if self.use_ego and len(outputs) > 2 else None
 
         # Trajectory & Geometry Post-Processing
         trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask, ego_mask)
@@ -182,10 +185,11 @@ def run_batch_inference(
     bdd_only=False,
     lane_thresh=0.50,
     weights_path="twin/weights/best_model.pth",
+    use_ego=False,
 ):
     """Runs batch inference with sampling options and configurable lane sensitivity."""
     os.makedirs(output_dir, exist_ok=True)
-    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh)
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, use_ego=use_ego)
 
     if not os.path.exists(source_dir):
         print(f"Source path '{source_dir}' does not exist!")
@@ -248,13 +252,14 @@ def run_batch_inference(
 
 
 def run_video_inference(video_path, output_path, weights_path="twin/weights/best_model.pth", lane_thresh=0.50,
-                        ema_alpha=0.4):
+                        ema_alpha=0.4, use_ego=False):
     """Runs the HUD over a video; consecutive frames are temporally smoothed (ema_alpha = weight of the newest frame)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video '{video_path}'")
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, ema_alpha=ema_alpha)
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, ema_alpha=ema_alpha,
+                                     use_ego=use_ego)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     writer, latencies, modes = None, [], {}
@@ -294,13 +299,15 @@ if __name__ == "__main__":
     parser.add_argument("--video", type=str, default=None, help="Process a video file instead of images")
     parser.add_argument("--smooth", type=float, default=0.4,
                         help="Video only: EMA weight of the newest frame for the trajectory (0 = no smoothing)")
+    parser.add_argument("--use-ego", action="store_true",
+                        help="v2 only: draw the ego-lane prediction and use it as the trajectory fallback")
 
     args = parser.parse_args()
 
     if args.video:
         out = args.output if args.output.lower().endswith(".mp4") else os.path.join(args.output, "hud_video.mp4")
         run_video_inference(args.video, out, weights_path=args.weights, lane_thresh=args.lane_thresh,
-                            ema_alpha=args.smooth)
+                            ema_alpha=args.smooth, use_ego=args.use_ego)
         sys.exit(0)
 
     run_batch_inference(
@@ -311,4 +318,5 @@ if __name__ == "__main__":
         bdd_only=args.bdd_only,
         lane_thresh=args.lane_thresh,
         weights_path=args.weights,
+        use_ego=args.use_ego,
     )
