@@ -31,8 +31,11 @@ class TwinLiteNetDataset(Dataset):
     Reads images, drivable area masks, and lane masks.
     Applies real-time spatial and pixel-level augmentations.
     """
+    # Lane-mask value for pixels the loss must ignore (uncertain pseudo labels); metrics only use BDD frames
+    LANE_IGNORE = 255
+
     def __init__(self, data_dir, image_size=(640, 360), is_train=True, transform=None,
-                 with_ego=False, geometric_aug=False):
+                 with_ego=False, geometric_aug=False, pseudo_lanes=False, pseudo_weight=0.5):
         """
         Args:
             data_dir (str): Path to either 'data/processed/train' or 'data/processed/val'
@@ -41,6 +44,9 @@ class TwinLiteNetDataset(Dataset):
             transform (albumentations.Compose): Custom transforms to apply
             with_ego (bool): Also return the ego-lane mask from masks_ego/ (built by make_ego_masks.py)
             geometric_aug (bool): Add random scale/shift/rotate (like the base paper's random_perspective)
+            pseudo_lanes (bool): Supervise IDD lanes with teacher pseudo labels from masks_lanes_pseudo/
+                (built by make_pseudo_lanes.py); uncertain pixels become LANE_IGNORE
+            pseudo_weight (float): lane_valid for pseudo-labelled IDD frames (< 0.5 keeps them out of BDD metrics)
         """
         self.data_dir = data_dir
         self.image_size = image_size
@@ -55,6 +61,11 @@ class TwinLiteNetDataset(Dataset):
         self.ego_dir = os.path.join(data_dir, "masks_ego")
         if with_ego and not os.path.isdir(self.ego_dir):
             raise FileNotFoundError(f"'{self.ego_dir}' not found; run twin/src/utils/make_ego_masks.py first")
+        self.pseudo_lanes = pseudo_lanes
+        self.pseudo_weight = pseudo_weight
+        self.pseudo_dir = os.path.join(data_dir, "masks_lanes_pseudo")
+        if pseudo_lanes and not os.path.isdir(self.pseudo_dir):
+            raise FileNotFoundError(f"'{self.pseudo_dir}' not found; run twin/src/utils/make_pseudo_lanes.py first")
         
         # Load and align all filenames
         self.filenames = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -133,6 +144,13 @@ class TwinLiteNetDataset(Dataset):
         # Determine domain validity flag for selective masked loss:
         # BDD100K frames supervise lanes (1.0), IDD Lite frames skip lane supervision (0.0)
         is_bdd = 0.0 if "idd_lite" in filename.lower() else 1.0
+
+        # IDD frames with teacher pseudo labels: confident lane / not-lane pixels supervise at reduced weight,
+        # uncertain pixels are ignored by the loss
+        if self.pseudo_lanes and not is_bdd:
+            pseudo = cv2.imread(os.path.join(self.pseudo_dir, filename), cv2.IMREAD_GRAYSCALE)
+            lanes_mask = np.where(pseudo == 255, 1, np.where(pseudo == 0, 0, self.LANE_IGNORE)).astype(np.uint8)
+            is_bdd = self.pseudo_weight
         lane_valid_tensor = torch.tensor(is_bdd, dtype=torch.float32)
         
         # Apply transforms safely

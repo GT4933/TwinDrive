@@ -81,8 +81,16 @@ class TwinLiteLoss(nn.Module):
         self.lane_overlap = TverskyLoss() if lane_loss == "tversky" else self.dice
 
     def _gated(self, logits, targets, valids, overlap, overlap_weight):
-        """Per-image BCE + overlap loss, averaged over the images whose labels exist (valids == 1)."""
-        per_image = self.bce(logits, targets.float()).mean(dim=(1, 2)) + overlap_weight * overlap(logits, targets, reduce=False)
+        """
+        Per-image BCE + overlap loss, averaged over the images whose labels exist (weighted by valids).
+        Pixels labelled TwinLiteNetDataset.LANE_IGNORE (uncertain pseudo labels) are left out of both terms.
+        """
+        keep = (targets != TwinLiteNetDataset.LANE_IGNORE).float()
+        targets = targets.clamp(max=1).float() * keep
+        bce = (self.bce(logits, targets) * keep).sum(dim=(1, 2)) / keep.sum(dim=(1, 2)).clamp(min=1.0)
+        # Ignored pixels get a large negative logit, i.e. probability 0, so they add nothing to the overlap term
+        overlap_logits = logits.masked_fill(keep == 0, -1e4)
+        per_image = bce + overlap_weight * overlap(overlap_logits, targets, reduce=False)
         if valids is None:
             return per_image.mean()
         # Prevent division by zero if entire batch happens to be IDD
@@ -105,9 +113,11 @@ class TwinLiteLoss(nn.Module):
         # ---------------------------------------------------
         losses["lane"] = self._gated(pred_lanes.squeeze(1), target_lanes, lane_valids, self.lane_overlap, 1.5)
 
-        # Ego lane (BDD "direct" area): same domain gate, since IDD has no own-lane labels
+        # Ego lane (BDD "direct" area): BDD frames only, since IDD has no own-lane labels
+        # (IDD frames may carry a fractional lane weight for pseudo labels, so gate on the domain explicitly)
         if pred_ego is not None:
-            losses["ego"] = self._gated(pred_ego.squeeze(1), target_ego, lane_valids, self.dice, 1.0)
+            bdd_only = (lane_valids > 0.5).float() if lane_valids is not None else None
+            losses["ego"] = self._gated(pred_ego.squeeze(1), target_ego, bdd_only, self.dice, 1.0)
         return losses
 
 class TaskWeighting(nn.Module):
@@ -214,12 +224,13 @@ def train(args):
     if torch.cuda.is_available():
         print(f"GPU Name                 : {torch.cuda.get_device_name(0)}")
     print(f"Architecture             : {args.arch} | lane loss {args.lane_loss} | weighting {args.task_weighting} "
-          f"| geometric aug {args.geometric_aug}")
+          f"| geometric aug {args.geometric_aug} | IDD pseudo lanes {args.pseudo_lanes}")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     train_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/train", is_train=True, with_ego=with_ego,
-                                              geometric_aug=args.geometric_aug), args.max_train_samples)
+                                              geometric_aug=args.geometric_aug, pseudo_lanes=args.pseudo_lanes,
+                                              pseudo_weight=args.pseudo_weight), args.max_train_samples)
     val_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/val", is_train=False, with_ego=with_ego),
                          args.max_val_samples)
     print(f"Dataset Allocation       : {len(train_dataset)} Train | {len(val_dataset)} Val")
@@ -234,6 +245,13 @@ def train(args):
 
     model = ARCHS[args.arch]().to(device)
     print(f"Model Parameters         : {sum(p.numel() for p in model.parameters()):,}")
+    if args.init_weights:
+        # Fine-tuning: start from trained weights but a fresh optimizer, schedule and log
+        init = torch.load(args.init_weights, map_location=device)
+        if init.get("args", {}).get("arch", "v1") != args.arch:
+            raise ValueError(f"--init-weights '{args.init_weights}' is not a --arch {args.arch} checkpoint")
+        model.load_state_dict(init["model_state_dict"])
+        print(f"Initialised weights from : '{args.init_weights}'")
     criterion = TwinLiteLoss(lane_loss=args.lane_loss)
     tasks = ["drivable", "lane"] + (["ego"] if with_ego else [])
     weighting = TaskWeighting(tasks, mode=args.task_weighting).to(device)
@@ -361,6 +379,10 @@ if __name__ == "__main__":
                         help="Overlap term of the lane loss (tversky uses alpha=0.7 on FP, beta=0.3 on FN)")
     parser.add_argument("--task-weighting", choices=["fixed", "uncertainty"], default="fixed")
     parser.add_argument("--geometric-aug", action="store_true", help="Random scale/shift/rotate augmentation")
+    parser.add_argument("--pseudo-lanes", action="store_true",
+                        help="Supervise IDD lanes with teacher pseudo labels (run utils/make_pseudo_lanes.py first)")
+    parser.add_argument("--pseudo-weight", type=float, default=0.5, help="Loss weight of pseudo-labelled IDD frames")
+    parser.add_argument("--init-weights", type=str, default="", help="Start from a trained checkpoint (fine-tuning)")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Random subset size, for smoke tests")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Random subset size, for smoke tests")
     train(parser.parse_args())
