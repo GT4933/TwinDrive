@@ -29,11 +29,18 @@ class TrajectoryEngine:
         """Forget smoothing state (call between unrelated images or video clips)."""
         self._ema_offset = None
 
-    def process_frame(self, drivable_mask, lane_mask, ego_mask=None):
+    # A fitted boundary is only used (and drawn) when the model is confident about the line's pixels and the
+    # curve actually follows them. Otherwise that side is treated as "not seen".
+    MIN_LINE_CONFIDENCE = 0.7   # mean lane probability over the line's pixels
+    MAX_FIT_RMS_PX = 6.0        # mean distance between the curve and the line's row centres
+    MIN_FIT_ROWS = 30           # vertical extent a line must cover to be fitted
+
+    def process_frame(self, drivable_mask, lane_mask, ego_mask=None, lane_prob=None):
         """
         Extracts lane boundaries and computes telemetry offsets.
         ego_mask (optional): the model's own-lane prediction, used for a tighter fallback corridor
         when no lane markings are found.
+        lane_prob (optional): the lane head's per-pixel probabilities, used to keep only confident lines.
         """
 
         # Default fallback payload
@@ -87,12 +94,12 @@ class TrajectoryEngine:
         #    the camera centre. Merging every line on a side would mix in the neighbouring lanes' markings.
         left_line, right_line = self._nearest_lines(valid_lines)
 
-        # 5. Polynomial Curve Fitting (x as a function of y), only over the rows where each line was seen.
-        #    The bonnet usually hides the bottom of the frame, and extending a quadratic below its data
-        #    swings it off-screen, so we never evaluate a fit outside the observed rows.
+        # 5. Polynomial Curve Fitting (x as a function of y) through each line's row centres, only over the
+        #    rows where it was seen (the bonnet usually hides the bottom of the frame, and extending a
+        #    quadratic past its data swings it off-screen). Unconfident or badly fitting lines are dropped.
         fits = {}
         for side, line in (("left", left_line), ("right", right_line)):
-            fit = self._fit_line(line)
+            fit = self._fit_lane_line(line, clean_lanes, lane_prob)
             if fit is not None:
                 fits[side] = fit
 
@@ -125,20 +132,42 @@ class TrajectoryEngine:
         """Apparent width at row y relative to the bottom row (flat road: width grows linearly below the horizon)."""
         return float(np.clip((y - self.horizon_y) / (self.H - 1 - self.horizon_y), 0.15, 1.0))
 
-    def _fit_line(self, line):
-        """Returns (poly, y_lo, y_hi) fitted over the line's own rows, or None if it spans too few rows."""
-        if line is None:
+    def _fit_lane_line(self, contour, clean_lanes, lane_prob):
+        """Fits one lane line from its pixels, or returns None if the model is unsure about it or it isn't line-shaped."""
+        if contour is None:
             return None
-        xs, ys = line[:, 0], line[:, 1]
-        y_lo, y_hi = max(int(ys.min()), int(self.H * 0.45)), int(ys.max())
-        if y_hi - y_lo < 20:
+        blob = np.zeros_like(clean_lanes)
+        cv2.drawContours(blob, [contour.reshape(-1, 1, 2)], -1, 1, thickness=-1)
+        blob &= clean_lanes
+        ys, xs = np.nonzero(blob)
+        if len(ys) == 0:
             return None
-        # Short stretches cannot constrain curvature; a straight line is safer there
-        degree = 2 if y_hi - y_lo >= 80 else 1
-        try:
-            return np.poly1d(np.polyfit(ys, xs, degree)), y_lo, y_hi
-        except np.linalg.LinAlgError:
+        if lane_prob is not None and float(lane_prob[ys, xs].mean()) < self.MIN_LINE_CONFIDENCE:
             return None
+        # Fit through the centre of the line on each row: a contour outline has two x values per row,
+        # which a function x(y) cannot follow and which bends the quadratic into hooks
+        rows, inverse = np.unique(ys, return_inverse=True)
+        centres = np.bincount(inverse, weights=xs) / np.bincount(inverse)
+        return self._fit_points(centres, rows, self.MAX_FIT_RMS_PX)
+
+    def _fit_points(self, xs, ys, max_rms):
+        """
+        Fits x = f(y) and returns (poly, y_lo, y_hi), or None when the points cover too few rows or no
+        straight/quadratic curve follows them within max_rms pixels.
+        """
+        xs, ys = np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+        if len(ys) < 5 or ys.max() - ys.min() < self.MIN_FIT_ROWS:
+            return None
+        # Short stretches cannot constrain curvature, so try a straight line first there
+        degrees = (1, 2) if ys.max() - ys.min() < 80 else (2, 1)
+        for degree in degrees:
+            try:
+                poly = np.poly1d(np.polyfit(ys, xs, degree))
+            except np.linalg.LinAlgError:
+                continue
+            if np.sqrt(np.mean((poly(ys) - xs) ** 2)) <= max_rms:
+                return poly, int(ys.min()), int(ys.max())
+        return None
 
     def _nearest_lines(self, lines):
         """Returns (left, right): per side, the line whose bottom-most points lie closest to the camera centre."""
@@ -183,21 +212,6 @@ class TrajectoryEngine:
             traj_data["lane_center_x"] = self.cam_center_x + offset_bottom * scale
         return self._set_offset(traj_data)
 
-    def _fit_curve(self, pts_list, plot_y):
-        """Fits a degree-2 polynomial x = a*y^2 + b*y + c to avoid vertical slope singularities."""
-        if not pts_list:
-            return None
-
-        all_pts = np.vstack(pts_list)
-        xs, ys = all_pts[:, 0], all_pts[:, 1]
-
-        try:
-            coeffs = np.polyfit(ys, xs, 2)
-            fit_x = coeffs[0] * (plot_y ** 2) + coeffs[1] * plot_y + coeffs[2]
-            return fit_x.astype(np.int32)
-        except np.linalg.LinAlgError:
-            return None
-
     def _fallback(self, drivable_mask, ego_mask, traj_data):
         """No usable lane markings: follow the predicted ego lane if there is one, else the whole drivable area."""
         min_pixels = int(self.H * self.W * 0.01)
@@ -208,6 +222,12 @@ class TrajectoryEngine:
 
     def _fallback_to_region(self, region_mask, traj_data):
         """Calculates the region's centre of mass and extracts its outer corridor edges."""
+        # Keep only the largest connected patch: stray specks (reflections, pavement) would otherwise
+        # become the "leftmost road pixel" on some rows and bend the corridor edges
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(region_mask.astype(np.uint8), connectivity=8)
+        if count > 2:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            region_mask = (labels == largest).astype(np.uint8)
         # 1. Calculate Telemetry (Center of Mass of the near half of the frame)
         near = np.zeros_like(region_mask)
         near[int(self.H * 0.55):, :] = region_mask[int(self.H * 0.55):, :]
@@ -227,20 +247,21 @@ class TrajectoryEngine:
             x_indices = np.where(row > 0)[0]
 
             if len(x_indices) > 10: # Require a minimum width to count as a valid surface
-                left_pts.append([x_indices[0], y])      # Left-most pixel
-                right_pts.append([x_indices[-1], y])    # Right-most pixel
+                # A region touching the image border continues off-screen, so that is not a real edge
+                if x_indices[0] > 1:
+                    left_pts.append([x_indices[0], y])      # Left-most pixel
+                if x_indices[-1] < self.W - 2:
+                    right_pts.append([x_indices[-1], y])    # Right-most pixel
 
-        # 3. Fit Polynomials to the extracted edges
-        plot_y = np.linspace(int(self.H * 0.55), self.H - 1, num=20).astype(np.int32)
-
-        if len(left_pts) >= 5:
-            traj_data["left_x"] = self._fit_curve([np.array(left_pts)], plot_y)
-            if traj_data["left_x"] is not None:
-                traj_data["left_y"] = plot_y
-
-        if len(right_pts) >= 5:
-            traj_data["right_x"] = self._fit_curve([np.array(right_pts)], plot_y)
-            if traj_data["right_x"] is not None:
-                traj_data["right_y"] = plot_y
+        # 3. Fit each edge only over the rows where it was found, and only draw it if a curve follows it
+        for side, pts in (("left", left_pts), ("right", right_pts)):
+            if len(pts) < 5:
+                continue
+            pts = np.array(pts)
+            fit = self._fit_points(pts[:, 0], pts[:, 1], max_rms=2 * self.MAX_FIT_RMS_PX)
+            if fit is not None:
+                poly, y_lo, y_hi = fit
+                plot_y = np.linspace(y_lo, y_hi, num=20).astype(np.int32)
+                traj_data[f"{side}_x"], traj_data[f"{side}_y"] = poly(plot_y).astype(np.int32), plot_y
 
         return traj_data

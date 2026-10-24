@@ -164,7 +164,7 @@ class ADASInferencePipeline:
             if self.use_ego and len(outputs) > 2 else None
 
         # Trajectory & Geometry Post-Processing
-        trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask, ego_mask)
+        trajectory_data = self.trajectory_engine.process_frame(drivable_mask, lane_mask, ego_mask, lane_prob=lane_prob)
 
         # Draw HUD Overlay
         hud_frame = self.hud_visualizer.draw_hud(resized_frame, drivable_mask, lane_mask, trajectory_data, fps=fps,
