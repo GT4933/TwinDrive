@@ -29,10 +29,18 @@ from tqdm import tqdm
 PSEUDO_LANE, PSEUDO_IGNORE = 255, 128
 
 
-def load_yolop():
+def load_yolop(yolop_dir=None):
+    """
+    yolop_dir: a local copy of github.com/hustvl/YOLOP holding hubconf.py, lib/ and weights/End-to-end.pth
+    (much smaller than torch.hub's full-repo zip, which includes demo videos). None = download via torch.hub.
+    """
     import torch
-    print("Loading pre-trained YOLOP teacher from PyTorch Hub (hustvl/yolop)...")
-    model = torch.hub.load("hustvl/yolop", "yolop", pretrained=True)
+    if yolop_dir:
+        print(f"Loading pre-trained YOLOP teacher from local copy '{yolop_dir}'...")
+        model = torch.hub.load(yolop_dir, "yolop", source="local", pretrained=True)
+    else:
+        print("Loading pre-trained YOLOP teacher from PyTorch Hub (hustvl/yolop)...")
+        model = torch.hub.load("hustvl/yolop", "yolop", pretrained=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return model.to(device).eval(), device
 
@@ -112,7 +120,7 @@ def main(args):
     img_dir, drv_dir = os.path.join(split, "images"), os.path.join(split, "masks_drivable")
     out_dir = os.path.join(split, args.out_name)
     os.makedirs(out_dir, exist_ok=True)
-    model, device = (None, None) if args.no_yolop else load_yolop()
+    model, device = (None, None) if args.no_yolop else load_yolop(args.yolop_dir)
 
     counts = {"labelled": 0, "empty": 0, "rejected": 0}
     for name in tqdm(sorted(f for f in os.listdir(img_dir) if f.startswith("idd_lite_")), desc="IDD lane labels"):
@@ -133,6 +141,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IDD lane pseudo labels from YOLOP + OpenCV paint detection")
     parser.add_argument("--split-dir", default="data/processed/train")
     parser.add_argument("--no-yolop", action="store_true", help="OpenCV paint detection only (no download)")
+    parser.add_argument("--yolop-dir", default=None,
+                        help="Local YOLOP copy (hubconf.py, lib/, weights/End-to-end.pth); default downloads via torch.hub")
     parser.add_argument("--out-name", default="masks_lanes_pseudo_yolop",
                         help="Output folder inside --split-dir; train with --pseudo-dir <same name>")
     main(parser.parse_args())
