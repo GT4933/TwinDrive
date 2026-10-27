@@ -35,7 +35,8 @@ class TwinLiteNetDataset(Dataset):
     LANE_IGNORE = 255
 
     def __init__(self, data_dir, image_size=(640, 360), is_train=True, transform=None,
-                 with_ego=False, geometric_aug=False, pseudo_lanes=False, pseudo_weight=0.5):
+                 with_ego=False, geometric_aug=False, pseudo_lanes=False, pseudo_weight=0.5,
+                 pseudo_dir_name="masks_lanes_pseudo"):
         """
         Args:
             data_dir (str): Path to either 'data/processed/train' or 'data/processed/val'
@@ -47,6 +48,8 @@ class TwinLiteNetDataset(Dataset):
             pseudo_lanes (bool): Supervise IDD lanes with teacher pseudo labels from masks_lanes_pseudo/
                 (built by make_pseudo_lanes.py); uncertain pixels become LANE_IGNORE
             pseudo_weight (float): lane_valid for pseudo-labelled IDD frames (< 0.5 keeps them out of BDD metrics)
+            pseudo_dir_name (str): folder of pseudo labels inside data_dir (masks_lanes_pseudo = self-training,
+                masks_lanes_pseudo_yolop = YOLOP + OpenCV teacher)
         """
         self.data_dir = data_dir
         self.image_size = image_size
@@ -63,9 +66,9 @@ class TwinLiteNetDataset(Dataset):
             raise FileNotFoundError(f"'{self.ego_dir}' not found; run twin/src/utils/make_ego_masks.py first")
         self.pseudo_lanes = pseudo_lanes
         self.pseudo_weight = pseudo_weight
-        self.pseudo_dir = os.path.join(data_dir, "masks_lanes_pseudo")
+        self.pseudo_dir = os.path.join(data_dir, pseudo_dir_name)
         if pseudo_lanes and not os.path.isdir(self.pseudo_dir):
-            raise FileNotFoundError(f"'{self.pseudo_dir}' not found; run twin/src/utils/make_pseudo_lanes.py first")
+            raise FileNotFoundError(f"'{self.pseudo_dir}' not found; run make_pseudo_lanes.py or make_yolop_lanes.py first")
         
         # Load and align all filenames
         self.filenames = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])

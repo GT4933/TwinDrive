@@ -230,7 +230,8 @@ def train(args):
 
     train_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/train", is_train=True, with_ego=with_ego,
                                               geometric_aug=args.geometric_aug, pseudo_lanes=args.pseudo_lanes,
-                                              pseudo_weight=args.pseudo_weight), args.max_train_samples)
+                                              pseudo_weight=args.pseudo_weight, pseudo_dir_name=args.pseudo_dir),
+                           args.max_train_samples)
     val_dataset = subset(TwinLiteNetDataset(data_dir="data/processed/val", is_train=False, with_ego=with_ego),
                          args.max_val_samples)
     print(f"Dataset Allocation       : {len(train_dataset)} Train | {len(val_dataset)} Val")
@@ -382,6 +383,8 @@ if __name__ == "__main__":
     parser.add_argument("--pseudo-lanes", action="store_true",
                         help="Supervise IDD lanes with teacher pseudo labels (run utils/make_pseudo_lanes.py first)")
     parser.add_argument("--pseudo-weight", type=float, default=0.5, help="Loss weight of pseudo-labelled IDD frames")
+    parser.add_argument("--pseudo-dir", default="masks_lanes_pseudo",
+                        help="Pseudo-label folder: masks_lanes_pseudo (self-training) or masks_lanes_pseudo_yolop")
     parser.add_argument("--init-weights", type=str, default="", help="Start from a trained checkpoint (fine-tuning)")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Random subset size, for smoke tests")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Random subset size, for smoke tests")
