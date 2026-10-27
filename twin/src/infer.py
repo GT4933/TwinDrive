@@ -12,10 +12,10 @@ import torch.nn.functional as F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.models.twinlitenet import TwinLiteNet
-from src.models.twindrive_v2 import TwinDriveV2
+from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from src.postprocess.trajectory import TrajectoryEngine
 
-ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2}
+ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
 
 
 class HUDVisualizer:

@@ -16,7 +16,7 @@ sys.path.append(os.path.join(ROOT, "base_paper"))
 import torch
 
 from src.models.twinlitenet import TwinLiteNet
-from src.models.twindrive_v2 import TwinDriveV2
+from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
 
 
@@ -53,7 +53,8 @@ def latency_ms(model, x, warmup=20, iters=100, repeats=3):
 
 
 if __name__ == "__main__":
-    models = {"TwinDrive v1": TwinLiteNet, "TwinDrive v2": TwinDriveV2, "TwinLiteNet (base)": BaseTwinLiteNet}
+    models = {"TwinDrive v1": TwinLiteNet, "TwinDrive v2": TwinDriveV2, "TwinDrive v2lf": TwinDriveV2LaneFix,
+              "TwinLiteNet (base)": BaseTwinLiteNet}
     print(f"{'model':20s} {'params':>10s} {'conv GMACs':>11s} {'latency ms (3 repeats)':>26s}")
     for name, cls in models.items():
         model = cls().eval()

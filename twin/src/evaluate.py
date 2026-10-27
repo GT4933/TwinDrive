@@ -21,13 +21,13 @@ from src.utils.metrics import BinarySegMetric
 
 def build_model(arch, weights, device):
     """Returns (model, transform, to_binary) so both architectures run through the same metric code."""
-    if arch in ("twin", "v2"):
+    if arch in ("twin", "v2", "v2lf"):
         if arch == "twin":
             from src.models.twinlitenet import TwinLiteNet
             model = TwinLiteNet()
         else:
-            from src.models.twindrive_v2 import TwinDriveV2
-            model = TwinDriveV2()
+            from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
+            model = TwinDriveV2LaneFix() if arch == "v2lf" else TwinDriveV2()
         # TwinDrive trains on ImageNet-normalised RGB and outputs one logit per head
         transform = A.Compose([
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -54,7 +54,7 @@ def build_model(arch, weights, device):
 def evaluate(arch, weights, data_dir="data/processed/val", batch_size=8, workers=4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, transform, to_binary = build_model(arch, weights, device)
-    with_ego = arch == "v2"
+    with_ego = arch in ("v2", "v2lf")
     dataset = TwinLiteNetDataset(data_dir=data_dir, is_train=False, transform=transform, with_ego=with_ego)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=True)
 
@@ -89,8 +89,8 @@ def evaluate(arch, weights, data_dir="data/processed/val", batch_size=8, workers
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Score TwinDrive or the TwinLiteNet baseline with identical metrics")
-    parser.add_argument("--arch", choices=["twin", "v2", "base"], required=True,
-                        help="twin = TwinDrive v1, v2 = TwinDrive v2, base = TwinLiteNet baseline")
+    parser.add_argument("--arch", choices=["twin", "v2", "v2lf", "base"], required=True,
+                        help="twin = TwinDrive v1, v2 = TwinDrive v2, v2lf = v2 with full-res lane head, base = TwinLiteNet")
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data/processed/val")
     parser.add_argument("--batch-size", type=int, default=8)

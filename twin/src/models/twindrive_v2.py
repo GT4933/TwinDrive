@@ -85,28 +85,33 @@ class EncoderV2(nn.Module):
 class SkipDecoderHead(nn.Module):
     """
     Upsamples x2 at a time, fusing the encoder feature of the same resolution at each step, and predicts
-    one logit per pixel at `out_stride` (4 or 2). Only the 1-channel logits are bilinearly resized to full
-    resolution, so no heavy convolution runs at 360x640.
+    one logit per pixel at `out_stride` (4, 2 or 1). Below full resolution only the 1-channel logits are
+    bilinearly resized, so no heavy convolution runs at 360x640. out_stride 1 adds a learned x2 upsampling
+    (transposed conv, as in TwinLiteNet's UPx2) so thin lanes are predicted at full resolution instead of
+    being smeared ~2x wider by stretching a half-resolution output.
     """
     def __init__(self, out_stride):
         super(SkipDecoderHead, self).__init__()
-        assert out_stride in (2, 4)
+        assert out_stride in (1, 2, 4)
         self.out_stride = out_stride
         self.reduce = ConvBNReLU(128, 64, kernel_size=1, padding=0)
         self.fuse4 = DepthwiseSeparableConv(64 + 32, 48)
-        if out_stride == 2:
+        if out_stride <= 2:
             self.fuse2 = DepthwiseSeparableConv(48 + 16, 32)
-            self.classifier = nn.Conv2d(32, 1, kernel_size=1)
-        else:
-            self.classifier = nn.Conv2d(48, 1, kernel_size=1)
+        if out_stride == 1:
+            self.up1 = nn.Sequential(nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2, bias=False),
+                                     nn.BatchNorm2d(16), nn.ReLU(inplace=True))
+        self.classifier = nn.Conv2d({4: 48, 2: 32, 1: 16}[out_stride], 1, kernel_size=1)
 
     def forward(self, f2, f4, f8, target_size):
         x = self.reduce(f8)
         x = F.interpolate(x, size=f4.shape[2:], mode='bilinear', align_corners=False)
         x = self.fuse4(torch.cat([x, f4], dim=1))
-        if self.out_stride == 2:
+        if self.out_stride <= 2:
             x = F.interpolate(x, size=f2.shape[2:], mode='bilinear', align_corners=False)
             x = self.fuse2(torch.cat([x, f2], dim=1))
+        if self.out_stride == 1:
+            x = self.up1(x)
         logits = self.classifier(x)
         return F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
 
@@ -117,12 +122,13 @@ class TwinDriveV2(nn.Module):
     - Drivable and ego-lane heads stop at 1/4 resolution (large smooth regions need context, not detail).
     - The lane head goes to 1/2 resolution (thin lines need detail).
     - Ego lane = BDD's "direct" drivable area (the car's own lane), supervised on BDD frames only.
+    lane_out_stride=1 gives the "v2lf" (lane-fix) variant with a full-resolution lane head.
     """
-    def __init__(self):
+    def __init__(self, lane_out_stride=2):
         super(TwinDriveV2, self).__init__()
         self.encoder = EncoderV2()
         self.drivable_decoder = SkipDecoderHead(out_stride=4)
-        self.lane_decoder = SkipDecoderHead(out_stride=2)
+        self.lane_decoder = SkipDecoderHead(out_stride=lane_out_stride)
         self.ego_decoder = SkipDecoderHead(out_stride=4)
 
     def forward(self, x):
@@ -133,12 +139,18 @@ class TwinDriveV2(nn.Module):
                 self.ego_decoder(f2, f4, f8, target_size))
 
 
+class TwinDriveV2LaneFix(TwinDriveV2):
+    """TwinDrive v2 with a full-resolution lane head (arch name "v2lf")."""
+    def __init__(self):
+        super(TwinDriveV2LaneFix, self).__init__(lane_out_stride=1)
+
+
 if __name__ == "__main__":
-    model = TwinDriveV2().eval()
-    print(f"Total Trainable Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    with torch.no_grad():
-        outs = model(torch.randn(2, 3, 360, 640))
-    for name, o in zip(["drivable", "lanes", "ego"], outs):
-        assert o.shape == (2, 1, 360, 640), f"{name} head shape mismatch: {tuple(o.shape)}"
-        print(f"{name:9s} output shape: {tuple(o.shape)}")
+    for cls in (TwinDriveV2, TwinDriveV2LaneFix):
+        model = cls().eval()
+        print(f"{cls.__name__}: {sum(p.numel() for p in model.parameters()):,} trainable parameters")
+        with torch.no_grad():
+            outs = model(torch.randn(2, 3, 360, 640))
+        for name, o in zip(["drivable", "lanes", "ego"], outs):
+            assert o.shape == (2, 1, 360, 640), f"{name} head shape mismatch: {tuple(o.shape)}"
     print("TwinDriveV2 shape checks passed.")

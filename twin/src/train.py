@@ -19,11 +19,11 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from src.models.twinlitenet import TwinLiteNet
-from src.models.twindrive_v2 import TwinDriveV2
+from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from src.utils.dataset import TwinLiteNetDataset
 from src.utils.metrics import BinarySegMetric
 
-ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2}
+ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
 
 # ---------------------------------------------------------
 # 1. Custom Imbalance Loss Module (TwinLiteLoss)
@@ -73,21 +73,28 @@ class TwinLiteLoss(nn.Module):
     Multi-Task Loss with Domain-Gated Masking for Unlabeled Lanes.
     Returns a dict of per-task losses; TaskWeighting combines them into one number.
     """
-    def __init__(self, lane_loss="dice"):
+    def __init__(self, lane_loss="dice", tversky_alpha=0.7, tversky_beta=0.3, lane_overlap_weight=1.5,
+                 lane_focal_gamma=0.0):
         super(TwinLiteLoss, self).__init__()
         # reduction='none' allows us to isolate loss per image in the batch
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.dice = DiceLoss()
-        self.lane_overlap = TverskyLoss() if lane_loss == "tversky" else self.dice
+        self.lane_overlap = TverskyLoss(tversky_alpha, tversky_beta) if lane_loss == "tversky" else self.dice
+        self.lane_overlap_weight = lane_overlap_weight
+        # > 0 turns the lane BCE into focal BCE: easy (mostly background) pixels are down-weighted by (1 - p_t)^gamma
+        self.lane_focal_gamma = lane_focal_gamma
 
-    def _gated(self, logits, targets, valids, overlap, overlap_weight):
+    def _gated(self, logits, targets, valids, overlap, overlap_weight, focal_gamma=0.0):
         """
-        Per-image BCE + overlap loss, averaged over the images whose labels exist (weighted by valids).
-        Pixels labelled TwinLiteNetDataset.LANE_IGNORE (uncertain pseudo labels) are left out of both terms.
+        Per-image BCE (or focal BCE) + overlap loss, averaged over the images whose labels exist (weighted by
+        valids). Pixels labelled TwinLiteNetDataset.LANE_IGNORE (uncertain pseudo labels) are left out of both terms.
         """
         keep = (targets != TwinLiteNetDataset.LANE_IGNORE).float()
         targets = targets.clamp(max=1).float() * keep
-        bce = (self.bce(logits, targets) * keep).sum(dim=(1, 2)) / keep.sum(dim=(1, 2)).clamp(min=1.0)
+        pixel_bce = self.bce(logits, targets)
+        if focal_gamma > 0:
+            pixel_bce = (1 - torch.exp(-pixel_bce)) ** focal_gamma * pixel_bce   # exp(-BCE) = p_t
+        bce = (pixel_bce * keep).sum(dim=(1, 2)) / keep.sum(dim=(1, 2)).clamp(min=1.0)
         # Ignored pixels get a large negative logit, i.e. probability 0, so they add nothing to the overlap term
         overlap_logits = logits.masked_fill(keep == 0, -1e4)
         per_image = bce + overlap_weight * overlap(overlap_logits, targets, reduce=False)
@@ -111,7 +118,8 @@ class TwinLiteLoss(nn.Module):
         # ---------------------------------------------------
         # Lane Line Loss (Domain-Gated via Selective Masking)
         # ---------------------------------------------------
-        losses["lane"] = self._gated(pred_lanes.squeeze(1), target_lanes, lane_valids, self.lane_overlap, 1.5)
+        losses["lane"] = self._gated(pred_lanes.squeeze(1), target_lanes, lane_valids, self.lane_overlap,
+                                     self.lane_overlap_weight, self.lane_focal_gamma)
 
         # Ego lane (BDD "direct" area): BDD frames only, since IDD has no own-lane labels
         # (IDD frames may carry a fractional lane weight for pseudo labels, so gate on the domain explicitly)
@@ -216,7 +224,7 @@ def subset(dataset, max_samples, seed=0):
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    with_ego = args.arch == "v2"
+    with_ego = args.arch in ("v2", "v2lf")
     print("=" * 65)
     print("           TWINLITENET DUAL-HEAD TRAINING ENGINE")
     print("=" * 65)
@@ -253,7 +261,8 @@ def train(args):
             raise ValueError(f"--init-weights '{args.init_weights}' is not a --arch {args.arch} checkpoint")
         model.load_state_dict(init["model_state_dict"])
         print(f"Initialised weights from : '{args.init_weights}'")
-    criterion = TwinLiteLoss(lane_loss=args.lane_loss)
+    criterion = TwinLiteLoss(lane_loss=args.lane_loss, tversky_alpha=args.tversky_alpha, tversky_beta=args.tversky_beta,
+                             lane_overlap_weight=args.lane_overlap_weight, lane_focal_gamma=args.lane_focal_gamma)
     tasks = ["drivable", "lane"] + (["ego"] if with_ego else [])
     weighting = TaskWeighting(tasks, mode=args.task_weighting).to(device)
     optimizer = optim.AdamW(list(model.parameters()) + list(weighting.parameters()), lr=args.lr, weight_decay=1e-4)
@@ -378,6 +387,11 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default="", help="Path to latest_model.pth to continue a run")
     parser.add_argument("--lane-loss", choices=["dice", "tversky"], default="dice",
                         help="Overlap term of the lane loss (tversky uses alpha=0.7 on FP, beta=0.3 on FN)")
+    parser.add_argument("--tversky-alpha", type=float, default=0.7, help="Tversky weight on false positives")
+    parser.add_argument("--tversky-beta", type=float, default=0.3, help="Tversky weight on false negatives")
+    parser.add_argument("--lane-overlap-weight", type=float, default=1.5, help="Weight of the lane Dice/Tversky term")
+    parser.add_argument("--lane-focal-gamma", type=float, default=0.0,
+                        help="> 0 uses focal BCE for lanes (base paper uses 2); 0 = plain BCE")
     parser.add_argument("--task-weighting", choices=["fixed", "uncertainty"], default="fixed")
     parser.add_argument("--geometric-aug", action="store_true", help="Random scale/shift/rotate augmentation")
     parser.add_argument("--pseudo-lanes", action="store_true",
