@@ -12,8 +12,9 @@ IDD lane pseudo labels from an *external* teacher, ported from GT4933's `g` bran
 Differences from `g`, so labels plug into this branch's training without touching evaluation:
   - writes data/processed/train/masks_lanes_pseudo_yolop/ (train split only; validation keeps real BDD labels)
   - pixel values follow make_pseudo_lanes.py: 255 = lane, 0 = not lane, 128 = ignore. Images whose mask
-    is empty or rejected are written as all-ignore, so they give no lane supervision (as `g` gated them
-    with lane_valid = 0)
+     is empty or rejected are written as all-ignore, so they give no lane supervision (as `g` gated them
+     with lane_valid = 0)
+  - saves visual green-line overlays to visualizations_lanes/ (toggle with --no-vis)
   - `--no-yolop` runs the OpenCV half alone (no download needed)
 
 Train with `train.py --pseudo-lanes --pseudo-dir masks_lanes_pseudo_yolop`.
@@ -120,9 +121,15 @@ def main(args):
     img_dir, drv_dir = os.path.join(split, "images"), os.path.join(split, "masks_drivable")
     out_dir = os.path.join(split, args.out_name)
     os.makedirs(out_dir, exist_ok=True)
+
+    vis_dir = os.path.join(split, args.vis_name) if not args.no_vis else None
+    if vis_dir:
+        os.makedirs(vis_dir, exist_ok=True)
+
     model, device = (None, None) if args.no_yolop else load_yolop(args.yolop_dir)
 
     counts = {"labelled": 0, "empty": 0, "rejected": 0}
+    saved_vis = 0
     for name in tqdm(sorted(f for f in os.listdir(img_dir) if f.startswith("idd_lite_")), desc="IDD lane labels"):
         img = cv2.imread(os.path.join(img_dir, name))
         drivable = cv2.imread(os.path.join(drv_dir, name), cv2.IMREAD_GRAYSCALE)
@@ -132,9 +139,21 @@ def main(args):
         cv2.imwrite(os.path.join(out_dir, name), label)
         counts[status] += 1
 
+        if vis_dir:
+            vis_path = os.path.join(vis_dir, name)
+            if status == "labelled":
+                overlay = img.copy()
+                overlay[label == PSEUDO_LANE] = [0, 255, 0]  # Green lane lines
+                cv2.imwrite(vis_path, overlay)
+                saved_vis += 1
+            elif os.path.exists(vis_path):
+                os.remove(vis_path)
+
     total = sum(counts.values())
     print(f"  --> {counts['labelled']}/{total} IDD images labelled, {counts['empty']} empty, "
           f"{counts['rejected']} rejected (dense/fragmented); unlabelled ones are written as all-ignore")
+    if vis_dir:
+        print(f"  --> Saved {saved_vis} active lane visualizations to '{vis_dir}'")
 
 
 if __name__ == "__main__":
@@ -145,4 +164,7 @@ if __name__ == "__main__":
                         help="Local YOLOP copy (hubconf.py, lib/, weights/End-to-end.pth); default downloads via torch.hub")
     parser.add_argument("--out-name", default="masks_lanes_pseudo_yolop",
                         help="Output folder inside --split-dir; train with --pseudo-dir <same name>")
+    parser.add_argument("--vis-name", default="visualizations_lanes",
+                        help="Folder inside --split-dir to save green overlay visualizations")
+    parser.add_argument("--no-vis", action="store_true", help="Skip saving visual overlay frames")
     main(parser.parse_args())
