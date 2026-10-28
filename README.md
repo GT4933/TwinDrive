@@ -293,7 +293,7 @@ The following structured tasks are planned or required to bring the TwinDrive pr
 
 ## Authors & Acknowledgments
 
-- **Authors**: [Aadinarayan R](https://github.com/ChaChaEatsFruits), [Govind nair](https://github.com/GT4933), [Shreyas N](https://github.com/ShreyasNishanth)
+- **Authors**: [Aadinarayan R](https://github.com/ChaChaEatsFruits), [Govind Nair](https://github.com/GT4933), [Shreyas N](https://github.com/ShreyasNishanth)
 - **Base Architecture Reference**: [TwinLiteNet: An Efficient and Lightweight Model for Driveable Area and Lane Detection](https://github.com/chequanghuy/TwinLiteNet)
 - **Datasets**:
   - [BDD100K: A Diverse Driving Dataset for Heterogeneous Multitask Learning](https://www.bdd100k.com/)
