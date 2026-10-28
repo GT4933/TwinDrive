@@ -146,7 +146,8 @@ class TwinLiteNetDataset(Dataset):
         
         # Determine domain validity flag for selective masked loss:
         # BDD100K frames supervise lanes (1.0), IDD Lite frames skip lane supervision (0.0)
-        is_bdd = 0.0 if "idd_lite" in filename.lower() else 1.0
+        is_idd = "idd_lite" in filename.lower()
+        is_bdd = 0.0 if is_idd else 1.0
 
         # IDD frames with teacher pseudo labels: confident lane / not-lane pixels supervise at reduced weight,
         # uncertain pixels are ignored by the loss
@@ -167,8 +168,12 @@ class TwinLiteNetDataset(Dataset):
             drivable_tensor = augmented['drivable'].long()
             lanes_tensor = augmented['lanes'].long()
             if self.with_ego:
-                # Ego lane uses the same domain gate as lanes (IDD has no own-lane labels)
-                return image_tensor, drivable_tensor, lanes_tensor, lane_valid_tensor, augmented['ego'].long()
+                ego_tensor = augmented['ego'].long()
+                if is_idd:
+                    # IDD has no own-lane labels: ignore every pixel, so no lane_valid weight
+                    # (e.g. pseudo-labelled IDD frames at weight 1.0) can make the ego loss grade them
+                    ego_tensor = torch.full_like(ego_tensor, self.LANE_IGNORE)
+                return image_tensor, drivable_tensor, lanes_tensor, lane_valid_tensor, ego_tensor
         else:
             # Basic fallback if Albumentations is not installed
             # Resize manually
