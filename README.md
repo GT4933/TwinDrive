@@ -22,8 +22,9 @@ Designed for low-power edge platforms (e.g., NVIDIA Jetson Nano), TwinDrive exte
 - [Usage Guide](#usage-guide)
   - [1. Data Preparation](#1-data-preparation)
   - [2. IDD Pseudo-Label Generation & QA](#2-idd-pseudo-label-generation--qa)
-  - [3. Model Training](#3-model-training)
-  - [4. ADAS Inference & Telemetry HUD](#4-adas-inference--telemetry-hud)
+  - [3. DataLoader Integrity & Sanity Test (Optional)](#3-dataloader-integrity--sanity-test-optional)
+  - [4. Model Training](#4-model-training)
+  - [5. ADAS Inference & Telemetry HUD](#5-adas-inference--telemetry-hud)
 - [Comparison: TwinDrive vs. Base TwinLiteNet](#comparison-twindrive-vs-base-twinlitenet)
 - [What Has to Be Done (Roadmap & Action Plan)](#what-has-to-be-done-roadmap--action-plan)
 
@@ -197,7 +198,14 @@ python twin/src/utils/generate_idd_lane_labels.py
 python twin/src/utils/clean_idd_labels.py
 ```
 
-### 3. Model Training
+### 3. DataLoader Integrity & Sanity Test (Optional)
+Before starting training, you can verify that the processed dataset, augmentations, and domain flags load correctly:
+```bash
+python twin/src/utils/dataset.py
+```
+*Note: `dataset.py` does not modify or generate dataset files; it is an importable `torch.utils.data.Dataset` class used directly by `train.py`. Running it standalone runs a test batch inspection to confirm tensor shapes and active lane annotations.*
+
+### 4. Model Training
 Train the multi-task network with Cosine Annealing and domain-gated loss:
 ```bash
 python twin/src/train.py
@@ -209,7 +217,7 @@ python twin/src/train.py
 - `resume_checkpoint`: Path to resume weights (e.g., `"twin/weights/latest_model.pth"`).
 - `reset_best_loss`: When fine-tuning, resets best validation loss tracking.
 
-### 4. ADAS Inference & Telemetry HUD
+### 5. ADAS Inference & Telemetry HUD
 Run batch inference and generate HUD visualizations with trajectory telemetry:
 ```bash
 # Run on 15 validation images (mix of BDD100K and IDD Lite)
