@@ -33,7 +33,7 @@ base_paper/test_/
 *.pth
 *.onnx
 # Per-run training folders (twin/weights_v2, twin/weights_v2lf, ...). The shared best checkpoint,
-# twin/weights_v2lf_yolop/best_model.pth, is force-added on purpose; other runs stay local.
+# twin/weights_v2lf_yolop_10ep/best_model.pth, is force-added on purpose; other runs stay local.
 weights_*/
 runs/
 outputs/
