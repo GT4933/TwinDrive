@@ -10,14 +10,18 @@ import sys
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.append(os.path.join(ROOT, "twin"))
-sys.path.append(os.path.join(ROOT, "base_paper"))
+for p in [ROOT, os.path.join(ROOT, "twin"), os.path.join(ROOT, "base_paper")]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import torch
 
-from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
-from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+try:
+    from base_paper.model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+except ImportError:
+    from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
 
 
 def conv_macs(model, x):
@@ -53,7 +57,7 @@ def latency_ms(model, x, warmup=20, iters=100, repeats=3):
 
 
 if __name__ == "__main__":
-    models = {"TwinDrive v1": TwinLiteNet, "TwinDrive v2": TwinDriveV2, "TwinDrive v2lf": TwinDriveV2LaneFix,
+    models = {"TwinDrive v1": TwinDriveV1, "TwinDrive v2": TwinDriveV2, "TwinDrive v2lf": TwinDriveV2LaneFix,
               "TwinLiteNet (base)": BaseTwinLiteNet}
     print(f"{'model':20s} {'params':>10s} {'conv GMACs':>11s} {'latency ms (3 repeats)':>26s}")
     for name, cls in models.items():

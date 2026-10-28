@@ -1,8 +1,17 @@
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.twinlitenet import ConvBNReLU, DepthwiseSeparableConv
+twin_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if twin_dir not in sys.path:
+    sys.path.insert(0, twin_dir)
+
+try:
+    from src.models.twindrive_v1 import ConvBNReLU, DepthwiseSeparableConv
+except ImportError:
+    from twindrive_v1 import ConvBNReLU, DepthwiseSeparableConv
 
 
 class HFFDilatedContextBlock(nn.Module):

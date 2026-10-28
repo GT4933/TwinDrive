@@ -24,11 +24,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 
 PSEUDO_LANE, PSEUDO_IGNORE = 255, 128
-ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
+ARCHS = {"v1": TwinDriveV1, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
 
 
 def load_teacher(path, device):

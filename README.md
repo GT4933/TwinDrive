@@ -48,7 +48,7 @@ TwinDrive/
 │   ├── weights_v2lf_yolop_10ep/ shipped best checkpoint (best_model.pth) + train_log.csv
 │   └── src/
 │       ├── models/
-│       │   ├── twinlitenet.py       TwinDrive v1 (stride 16, single x16 upsample)        --arch v1 / twin
+│       │   ├── twindrive_v1.py      TwinDrive v1 (stride 16, single x16 upsample)        --arch v1 / twin
 │       │   └── twindrive_v2.py      TwinDrive v2 (stride 8, skip decoders, HFF, coordinate
 │       │                            attention, ego head) and v2lf (full-res lane head) --arch v2 / v2lf
 │       ├── utils/

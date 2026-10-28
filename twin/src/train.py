@@ -18,12 +18,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from src.utils.dataset import TwinLiteNetDataset
 from src.utils.metrics import BinarySegMetric
 
-ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
+ARCHS = {"v1": TwinDriveV1, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
 
 # ---------------------------------------------------------
 # 1. Custom Imbalance Loss Module (TwinLiteLoss)
@@ -226,7 +226,7 @@ def train(args):
     use_amp = device.type == "cuda"
     with_ego = args.arch in ("v2", "v2lf")
     print("=" * 65)
-    print("           TWINLITENET DUAL-HEAD TRAINING ENGINE")
+    print("           TWINDRIVE MULTI-TASK TRAINING ENGINE")
     print("=" * 65)
     print(f"Target Compute Hardware : {device}")
     if torch.cuda.is_available():

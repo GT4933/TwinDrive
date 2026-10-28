@@ -4,8 +4,9 @@ import argparse
 
 # Project root (twin/) for src.*, and base_paper/ for the TwinLiteNet baseline
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.append(os.path.join(ROOT, "twin"))
-sys.path.append(os.path.join(ROOT, "base_paper"))
+for p in [ROOT, os.path.join(ROOT, "twin"), os.path.join(ROOT, "base_paper")]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
@@ -21,10 +22,10 @@ from src.utils.metrics import BinarySegMetric
 
 def build_model(arch, weights, device):
     """Returns (model, transform, to_binary) so both architectures run through the same metric code."""
-    if arch in ("twin", "v2", "v2lf"):
-        if arch == "twin":
-            from src.models.twinlitenet import TwinLiteNet
-            model = TwinLiteNet()
+    if arch in ("twin", "v1", "v2", "v2lf"):
+        if arch in ("twin", "v1"):
+            from src.models.twindrive_v1 import TwinDriveV1
+            model = TwinDriveV1()
         else:
             from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
             model = TwinDriveV2LaneFix() if arch == "v2lf" else TwinDriveV2()
@@ -35,7 +36,10 @@ def build_model(arch, weights, device):
         ], additional_targets={'drivable': 'mask', 'lanes': 'mask', 'ego': 'mask'})
         to_binary = lambda logits: torch.sigmoid(logits[:, 0].float()) > 0.5
     else:
-        from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+        try:
+            from base_paper.model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+        except ImportError:
+            from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
         model = BaseTwinLiteNet()
         # Base trains on RGB scaled to 0-1 (no mean/std) and outputs two-class logits
         transform = A.Compose([
@@ -89,8 +93,8 @@ def evaluate(arch, weights, data_dir="data/processed/val", batch_size=8, workers
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Score TwinDrive or the TwinLiteNet baseline with identical metrics")
-    parser.add_argument("--arch", choices=["twin", "v2", "v2lf", "base"], required=True,
-                        help="twin = TwinDrive v1, v2 = TwinDrive v2, v2lf = v2 with full-res lane head, base = TwinLiteNet")
+    parser.add_argument("--arch", choices=["v1", "twin", "v2", "v2lf", "base"], required=True,
+                        help="v1/twin = TwinDrive v1, v2 = TwinDrive v2, v2lf = v2 with full-res lane head, base = TwinLiteNet")
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data/processed/val")
     parser.add_argument("--batch-size", type=int, default=8)

@@ -26,32 +26,30 @@ def check_environment():
     print("=" * 50)
 
 def build_directories():
-    """Programmatically creates a standardized folder structure for TwinLiteNet."""
+    """Programmatically creates a standardized folder structure for TwinDrive."""
     print("\nInitializing project directory structure...")
     
     # Define the directory tree
     folders = [
-        # Dataset storage
-        "data/raw/bdd100k",
-        "data/raw/idd_lite",
-        
-        # Formatted/aligned training data for TwinLiteNet
+        # Formatted/aligned training data
         "data/processed/train/images",
         "data/processed/train/masks_drivable",
         "data/processed/train/masks_lanes",
+        "data/processed/train/masks_ego",
         
         "data/processed/val/images",
         "data/processed/val/masks_drivable",
         "data/processed/val/masks_lanes",
+        "data/processed/val/masks_ego",
         
         # Weights and Model outputs
-        "weights",
-        "outputs/predictions",
+        "twin/weights",
+        "twin/outputs/predictions",
         
         # Source code modules
-        "src/models",
-        "src/utils",
-        "src/postprocess"
+        "twin/src/models",
+        "twin/src/utils",
+        "twin/src/postprocess"
     ]
     
     created_count = 0

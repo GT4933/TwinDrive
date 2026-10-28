@@ -11,11 +11,11 @@ import torch.nn.functional as F
 # Add project root path for module resolution
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.models.twinlitenet import TwinLiteNet
+from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from src.postprocess.trajectory import TrajectoryEngine
 
-ARCHS = {"v1": TwinLiteNet, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
+ARCHS = {"v1": TwinDriveV1, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
 
 
 class HUDVisualizer:
@@ -288,7 +288,7 @@ def run_video_inference(video_path, output_path, weights_path="twin/weights/best
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TwinLiteNet Real-Time ADAS Telemetry Engine")
+    parser = argparse.ArgumentParser(description="TwinDrive Real-Time ADAS Telemetry Engine")
     parser.add_argument("--source", type=str, default="data/processed/val/images")
     parser.add_argument("--output", type=str, default="twin/outputs/predictions")
     parser.add_argument("--samples", type=int, default=10)
