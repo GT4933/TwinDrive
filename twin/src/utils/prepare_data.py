@@ -134,9 +134,14 @@ if __name__ == "__main__":
     # 1. BDD100K Dataset Parsing
     # -------------------------------------------------------------
     print("\n[1/2] Scanning BDD100K Directory Tree...")
-    # BDD100K: full 100K split (70k train / 10k val), same source the base paper uses.
-    bdd_root = "datasets"
-    bdd_img_root = os.path.join(bdd_root, "100k")
+    # Supports both datasets/100k (full) and data/raw/bdd100k_images_10k/10k (local 10k)
+    if os.path.exists("datasets/100k"):
+        bdd_root = "datasets"
+        bdd_img_root = os.path.join(bdd_root, "100k")
+    else:
+        bdd_root = base_raw
+        bdd_img_root = os.path.join(bdd_root, "bdd100k_images_10k", "10k")
+
     bdd_mask_root = os.path.join(bdd_root, "bdd_seg_gt")
     bdd_lane_root = os.path.join(bdd_root, "bdd_lane_gt")
 

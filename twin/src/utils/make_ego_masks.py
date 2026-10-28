@@ -49,6 +49,13 @@ def build_jobs(split):
             stem = os.path.splitext(name[len("bdd100k_"):])[0]
             raw = os.path.join(BDD_DRIVABLE_MAPS, split, stem + "_drivable_id.png")
             if not os.path.exists(raw):
+                # Fallback: check in other splits (train / val) if split mismatch exists
+                for alt_split in ["train", "val"]:
+                    alt_path = os.path.join(BDD_DRIVABLE_MAPS, alt_split, stem + "_drivable_id.png")
+                    if os.path.exists(alt_path):
+                        raw = alt_path
+                        break
+            if not os.path.exists(raw):
                 raise FileNotFoundError(f"No BDD drivable map for '{name}' at '{raw}'")
         else:
             raw = None
