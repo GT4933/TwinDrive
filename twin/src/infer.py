@@ -8,14 +8,27 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Add project root path for module resolution
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Add project root and base_paper paths for module resolution
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+for p in [ROOT, os.path.join(ROOT, "twin"), os.path.join(ROOT, "base_paper")]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
 from src.postprocess.trajectory import TrajectoryEngine
 
+try:
+    from base_paper.model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+except ImportError:
+    try:
+        from model.TwinLite import TwinLiteNet as BaseTwinLiteNet
+    except ImportError:
+        BaseTwinLiteNet = None
+
 ARCHS = {"v1": TwinDriveV1, "v2": TwinDriveV2, "v2lf": TwinDriveV2LaneFix}
+if BaseTwinLiteNet is not None:
+    ARCHS["base"] = BaseTwinLiteNet
 
 
 class HUDVisualizer:
@@ -88,25 +101,45 @@ class HUDVisualizer:
 class ADASInferencePipeline:
     """Executes end-to-end model inference, trajectory post-processing, and HUD generation."""
     def __init__(self, weights_path="twin/weights/best_model.pth", device=None, lane_thresh=0.50, ema_alpha=0.0,
-                 use_ego=False):
+                 use_ego=False, arch="auto"):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lane_thresh = lane_thresh
-        # v2's ego-lane head is opt-in: by default the HUD and trajectory use only drivable area + lanes
         self.use_ego = use_ego
         print(f"\nInitializing ADAS Pipeline on Hardware: {self.device}")
 
         if not os.path.exists(weights_path):
             raise FileNotFoundError(f"Checkpoint '{weights_path}' not found (refusing to run a randomly initialised model)")
         checkpoint = torch.load(weights_path, map_location=self.device)
+
+        detected_arch = None
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            # Training checkpoints record their architecture; older ones predate v2 and are v1
-            arch = checkpoint.get("args", {}).get("arch", "v1")
+            detected_arch = checkpoint.get("args", {}).get("arch")
             state = checkpoint["model_state_dict"]
         else:
-            arch, state = "v1", checkpoint
-        self.model = ARCHS[arch]().to(self.device)
+            state = checkpoint
+
+        # Strip DataParallel prefix if present
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
+        if arch and arch != "auto":
+            self.arch = arch
+        elif detected_arch:
+            self.arch = detected_arch
+        else:
+            # Heuristic detection from state dictionary keys
+            if any(k.startswith(("up_1_1", "classifier_1", "level3")) for k in state.keys()):
+                self.arch = "base"
+            elif any(k.startswith("ego_decoder") for k in state.keys()):
+                self.arch = "v2lf" if any("up1" in k for k in state.keys()) else "v2"
+            else:
+                self.arch = "v1"
+
+        if self.arch not in ARCHS:
+            raise ValueError(f"Unknown architecture '{self.arch}'. Available: {list(ARCHS.keys())}")
+
+        self.model = ARCHS[self.arch]().to(self.device)
         self.model.load_state_dict(state)
-        print(f"  --> Successfully loaded {arch} model weights from: '{weights_path}'")
+        print(f"  --> Successfully loaded {self.arch} model weights from: '{weights_path}'")
 
         self.model.eval()
 
@@ -125,7 +158,9 @@ class ADASInferencePipeline:
             torch.cuda.synchronize()
 
     def _extract_prob(self, logits):
-        """Heads output (1, 1, H, W) logits; sigmoid gives per-pixel probability, returned as (H, W)."""
+        """Extracts foreground class-1 probability (H, W). Handles 1-channel sigmoid or 2-channel softmax."""
+        if logits.shape[1] > 1:
+            return torch.softmax(logits, dim=1)[0, 1].float().cpu().numpy()
         return torch.sigmoid(logits)[0, 0].float().cpu().numpy()
 
     def process_image(self, bgr_image):
@@ -137,9 +172,10 @@ class ADASInferencePipeline:
 
         # Normalize and convert to tensor
         norm_img = rgb_frame.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        norm_img = (norm_img - mean) / std
+        if self.arch != "base":
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            norm_img = (norm_img - mean) / std
 
         tensor_img = torch.from_numpy(norm_img).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
 
@@ -186,10 +222,11 @@ def run_batch_inference(
     lane_thresh=0.50,
     weights_path="twin/weights/best_model.pth",
     use_ego=False,
+    arch="auto",
 ):
     """Runs batch inference with sampling options and configurable lane sensitivity."""
     os.makedirs(output_dir, exist_ok=True)
-    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, use_ego=use_ego)
+    pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, use_ego=use_ego, arch=arch)
 
     if not os.path.exists(source_dir):
         print(f"Source path '{source_dir}' does not exist!")
@@ -252,14 +289,14 @@ def run_batch_inference(
 
 
 def run_video_inference(video_path, output_path, weights_path="twin/weights/best_model.pth", lane_thresh=0.50,
-                        ema_alpha=0.4, use_ego=False):
+                        ema_alpha=0.4, use_ego=False, arch="auto"):
     """Runs the HUD over a video; consecutive frames are temporally smoothed (ema_alpha = weight of the newest frame)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video '{video_path}'")
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
     pipeline = ADASInferencePipeline(weights_path=weights_path, lane_thresh=lane_thresh, ema_alpha=ema_alpha,
-                                     use_ego=use_ego)
+                                     use_ego=use_ego, arch=arch)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     writer, latencies, modes = None, [], {}
@@ -301,13 +338,15 @@ if __name__ == "__main__":
                         help="Video only: EMA weight of the newest frame for the trajectory (0 = no smoothing)")
     parser.add_argument("--use-ego", action="store_true",
                         help="v2 only: draw the ego-lane prediction and use it as the trajectory fallback")
+    parser.add_argument("--arch", choices=["v1", "v2", "v2lf", "base", "auto"], default="auto",
+                        help="Model architecture (default: auto-detected from weights)")
 
     args = parser.parse_args()
 
     if args.video:
         out = args.output if args.output.lower().endswith(".mp4") else os.path.join(args.output, "hud_video.mp4")
         run_video_inference(args.video, out, weights_path=args.weights, lane_thresh=args.lane_thresh,
-                            ema_alpha=args.smooth, use_ego=args.use_ego)
+                            ema_alpha=args.smooth, use_ego=args.use_ego, arch=args.arch)
         sys.exit(0)
 
     run_batch_inference(
@@ -319,4 +358,5 @@ if __name__ == "__main__":
         lane_thresh=args.lane_thresh,
         weights_path=args.weights,
         use_ego=args.use_ego,
+        arch=args.arch,
     )

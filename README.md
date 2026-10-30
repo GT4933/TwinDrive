@@ -32,7 +32,7 @@ Scored by `twin/src/evaluate.py` on 10,204 validation images (10,000 BDD100K + 2
 - The cm lane offset on the HUD is **uncalibrated** (an assumed camera geometry); treat it as a demo.
 - IDD has no lane labels, so there is no IDD lane score.
 
-The full write-up is in `docs/TwinDrive_Results_Report.md`, if present.
+Detailed technical analyses and architectural deep-dives are located in `docs/` (`docs/project_flow_analysis_g2.md`, `docs/model_comparison_analysis.md`, etc.).
 
 ---
 
@@ -41,6 +41,7 @@ The full write-up is in `docs/TwinDrive_Results_Report.md`, if present.
 ```
 TwinDrive/
 ├── README.md
+├── run_pipeline.py              automated end-to-end pipeline runner (demo, eval, train, full)
 ├── setup.py                     environment check + folder skeleton (not a packaging file)
 ├── base_paper/                  TwinLiteNet re-implementation (baseline), runs from inside this folder
 ├── twin/
@@ -61,7 +62,7 @@ TwinDrive/
 │       │   ├── check_processed.py / check_idd_labels.py / reprocess_idd.py   sanity checks and helpers
 │       ├── train.py                 training (CLI)
 │       ├── evaluate.py              shared evaluator for v1 / v2 / v2lf / base
-│       ├── benchmark.py             params, MACs, synchronised GPU latency
+│       ├── benchmark.py             params, GMACs/GFLOPs, and synchronised GPU latency & TFLOPS
 │       ├── infer.py                 images / video -> HUD
 │       └── postprocess/trajectory.py  lane-boundary fitting + lateral offset
 ├── datasets/                    (not in git) BDD100K images and labels
@@ -83,7 +84,7 @@ python -m venv .venv
 (On Linux/macOS: `source .venv/bin/activate`.)
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 ```bash
 pip install -r twin/requirements.txt
@@ -95,7 +96,27 @@ python setup.py
 
 ---
 
-## 2. Data
+## 2. Automated Pipeline Quickstart (`run_pipeline.py`)
+
+You can run the entire workflow end-to-end with a single command:
+
+```bash
+# 1. Quick demo run (< 30s): verify environment, benchmark hardware, generate sample HUD frames
+python run_pipeline.py --mode demo
+
+# 2. Evaluation run: benchmark hardware, score validation split across 10,204 images, generate predictions
+python run_pipeline.py --mode eval
+
+# 3. Model training: verify data, extract ego masks, train v2lf model, evaluate and test
+python run_pipeline.py --mode train --arch v2lf --epochs 10
+
+# 4. Video processing: run trained model over a video clip with temporal smoothing
+python run_pipeline.py --mode demo --video path/to/dashcam.mp4
+```
+
+---
+
+## 3. Data
 
 Datasets aren't in git. Put them here:
 
@@ -136,7 +157,7 @@ This writes `data/processed/train/masks_lanes_pseudo_yolop/`. In our run, 549 of
 
 ---
 
-## 3. Use the shipped model (no training needed)
+## 4. Manual Execution Guide
 
 ### Images
 ```bash
@@ -167,16 +188,17 @@ The architecture is read from the checkpoint automatically.
 ```bash
 python twin/src/evaluate.py --arch v2lf --weights twin/weights_v2lf_yolop_10ep/best_model.pth
 ```
-`--arch` takes `twin` (v1), `v2`, `v2lf` or `base`.
+`--arch` takes `v1` (or `twin`), `v2`, `v2lf` or `base`.
 
-### Size and speed of every architecture
+### Size, GFLOPs, and speed of every architecture
 ```bash
 python twin/src/benchmark.py
 ```
+Measures parameters, conv GMACs, conv GFLOPs, total floating-point operations (`all GFLOPs` via `FlopCounterMode`), synchronized GPU latency, and sustained TFLOPS throughput.
 
 ---
 
-## 4. Train
+## 5. Train Manually
 
 The configuration of the shipped model:
 ```bash
@@ -189,7 +211,7 @@ Each run writes `best_model.pth` (best on (BDD drivable mIoU + BDD lane IoU) / 2
 | `--arch v1 \| v2 \| v2lf` | model (v2lf = v2 with a full-resolution lane head; recommended) |
 | `--epochs N` | length of the cosine LR schedule |
 | `--batch-size 8`, `--lr 5e-4` | defaults |
-| `--workers N` | data-loading processes (12 was fastest on an 8-core CPU) |
+| `--workers N` | data-loading processes (12 was fastest on an 8-core CPU; use 2–4 on lower-memory Windows setups) |
 | `--geometric-aug` | random scale / shift / rotate |
 | `--lane-loss dice \| tversky`, `--tversky-alpha`, `--tversky-beta` | overlap term of the lane loss (α weights false positives) |
 | `--lane-overlap-weight`, `--lane-focal-gamma` | lane Dice/Tversky weight; focal BCE strength (0 = plain BCE) |
@@ -205,7 +227,7 @@ Each run writes `best_model.pth` (best on (BDD drivable mIoU + BDD lane IoU) / 2
 
 ---
 
-## 5. Baseline (TwinLiteNet)
+## 6. Baseline (TwinLiteNet)
 
 Run these from inside `base_paper/`. They expect `base_paper/data/bdd100k/{images,segments,lane}/{train,val}` (junctions or links to the `datasets/` folders). See `base_paper/README.md`.
 
@@ -226,7 +248,8 @@ python twin/src/evaluate.py --arch base --weights base_paper/test_/model_2.pth
 
 | Branch | Content |
 |---|---|
-| `main` | everything above |
-| `fix/phase0-data` | the working branch that was merged into `main` |
-| `g` | GT4933's IDD lane-labelling experiments; the labeller is ported here as `make_yolop_lanes.py` |
+| `main` | stable release with v2, v2lf, baseline, and evaluation |
+| `g2` | experimental update branch |
+| `g` | initial twindrive v1 implementation |
+| `fix/phase0-data` | initial twindrive v2 + v2lf merge |
 | `vid` | early video / webcam inference work |
