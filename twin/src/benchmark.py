@@ -15,6 +15,7 @@ for p in [ROOT, os.path.join(ROOT, "twin"), os.path.join(ROOT, "base_paper")]:
         sys.path.insert(0, p)
 
 import torch
+from torch.utils.flop_counter import FlopCounterMode
 
 from src.models.twindrive_v1 import TwinDriveV1
 from src.models.twindrive_v2 import TwinDriveV2, TwinDriveV2LaneFix
@@ -55,20 +56,28 @@ def latency_ms(model, x, warmup=20, iters=100, repeats=3):
             results.append((time.perf_counter() - start) / iters * 1000)
     return results
 
+def total_flops(model, x):
+    with torch.no_grad(), FlopCounterMode(display=False) as fc:
+        model(x)
+    return fc.get_total_flops()
 
 if __name__ == "__main__":
     models = {"TwinDrive v1": TwinDriveV1, "TwinDrive v2": TwinDriveV2, "TwinDrive v2lf": TwinDriveV2LaneFix,
               "TwinLiteNet (base)": BaseTwinLiteNet}
-    print(f"{'model':20s} {'params':>10s} {'conv GMACs':>11s} {'latency ms (3 repeats)':>26s}")
+    print(f"{'model':20s} {'params':>10s} {'conv GMACs':>11s} {'conv GFLOPs':>12s} {'all GFLOPs':>11s} "
+          f"{'latency ms (3 repeats)':>26s} {'TFLOPS':>7s}")
     for name, cls in models.items():
         model = cls().eval()
+        x_cpu = torch.zeros(1, 3, 360, 640)
         params = sum(p.numel() for p in model.parameters())
-        macs = conv_macs(model, torch.zeros(1, 3, 360, 640))
-        line = f"{name:20s} {params:>10,d} {macs / 1e9:>11.2f}"
+        macs = conv_macs(model, x_cpu)
+        flops_all = total_flops(model, x_cpu)
+        line = f"{name:20s} {params:>10,d} {macs / 1e9:>11.2f} {2 * macs / 1e9:>12.2f} {flops_all / 1e9:>11.2f}"
         if torch.cuda.is_available():
             model = model.cuda()
             runs = latency_ms(model, torch.randn(1, 3, 360, 640, device="cuda"))
-            line += "   " + ", ".join(f"{r:.2f}" for r in runs)
+            tflops = flops_all / (sum(runs) / len(runs) / 1e3) / 1e12
+            line += "   " + ", ".join(f"{r:.2f}" for r in runs) + f"   {tflops:>6.2f}"
         print(line)
     if torch.cuda.is_available():
-        print(f"(fp32, batch 1, {torch.cuda.get_device_name(0)}, model only; MACs exclude attention matmuls)")
+        print(f"(fp32, batch 1, {torch.cuda.get_device_name(0)}, model only)")
