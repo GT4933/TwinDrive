@@ -1,0 +1,25 @@
+# ==============================================================================
+# TwinDrive & TwinLiteNet (Base Paper) Unified Requirements
+# ==============================================================================
+# Note: On Windows/Linux, install PyTorch with your target CUDA runtime first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Then install this unified requirements file:
+#   pip install -r requirements.txt
+# ==============================================================================
+
+# Core Deep Learning & Vision (Shared across TwinDrive & base_paper)
+torch>=2.11
+torchvision>=0.26
+opencv-python>=4.9
+numpy>=1.26
+pillow
+tqdm
+
+# Multi-Target Data Augmentation & Evaluation (TwinDrive & evaluate.py)
+albumentations==2.0.8
+
+# IDD Lite Lane Pseudo-Labeling via YOLOP Teacher (twin/src/utils/make_yolop_lanes.py)
+yacs
+prefetch_generator
+matplotlib
+

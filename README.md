@@ -87,7 +87,7 @@ python -m venv .venv
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 ```bash
-pip install -r twin/requirements.txt
+pip install -r requirements.txt
 ```
 ```bash
 python setup.py
